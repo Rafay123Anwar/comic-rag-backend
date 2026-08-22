@@ -35,26 +35,75 @@ PAGE_SCOPED_REGEX = re.compile(
     r"\b(what('s|\s+is)?\s+happening|what\s+happened|what\s+happend)\b|"
     r"\b(kya\s+ho\s+raha\s+hai|kya\s+hua)\b|"
     r"\b(here|yahan|idhar)\b|"
-    r"\b(tell\s+me\s+about\s+this)\b|"
-    r"\b(who\s+appears|story\s+of\s+this|summary\s+of\s+this|describe\s+this)\b",
+    r"\b(tell\s+me\s+about\s+this\s+page|describe\s+this\s+page)\b|"
+    r"\b(who\s+appears\s+on\s+this|who\s+is\s+on\s+this\s+page)\b",
     re.IGNORECASE
 )
+
+COMIC_WIDE_INDICATORS = [
+    "this comic", "is comic", "iss comic", "ye comic", "yeh comic", "the comic",
+    "whole comic", "entire comic", "poori comic", "complete comic", "all pages",
+    "story kya hai", "kya story hai", "story batao", "kahani kya hai", "plot",
+    "overall story", "what is the story", "tell me the story", "summary of comic",
+    "what is this comic about", "what happened in the comic", "comic ki story",
+    "story of the comic", "story of this comic", "short story", "story", "kahani",
+    "batao story", "story btao", "story btaao", "story iya hai", "story bta do"
+]
+
+
+def is_comic_wide_story_query(question: str) -> bool:
+    """Check if the question is inquiring about the overall comic, story arc, or summary."""
+    q = question.lower()
+    return any(ind in q for ind in COMIC_WIDE_INDICATORS)
 
 
 def is_page_scoped_query(question: str, current_page: int | None) -> bool:
     """Determine if a question should be grounded strictly in the active page."""
     if not current_page:
         return False
-    if PAGE_SCOPED_REGEX.search(question):
-        return True
     q = question.lower()
-    page_indicators = [
-        "this page", "is page", "ye page", "yeh page", "current page",
-        "in this", "on this", "about this", "this scene", "this panel",
-        "here", "yahan", "idhar", "happend", "happened", "happening",
-        "kya hua", "kya ho raha", "who appears", "story of", "summary of"
-    ]
-    return any(ind in q for ind in page_indicators)
+    has_page_keyword = any(p in q for p in [
+        "this page", "is page pe", "is page par", "ye page pe", "yeh page pe",
+        "on this page", "in this page", "this panel", "this scene", "who appears on this page",
+        "who appears here"
+    ])
+    # If the user explicitly asks about the comic story or whole comic, do not page-scope unless explicit page keyword is present
+    if is_comic_wide_story_query(question) and not has_page_keyword:
+        return False
+    if PAGE_SCOPED_REGEX.search(question) and not any(cw in q for cw in ["this comic", "is comic", "iss comic", "the comic", "whole comic", "entire comic", "poori comic"]):
+        return True
+    return has_page_keyword
+
+
+def get_comic_overview_chunks(comic_id: str) -> list[dict]:
+    """
+    Builds structured story chunks across all analyzed pages of the comic,
+    ensuring Mistral AI has the complete story arc (beginning, middle, climax/end).
+    """
+    from app.services.storage import get_comic_data
+    cdata = get_comic_data(comic_id)
+    if not cdata:
+        return []
+    pages = cdata.get("pages", [])
+    if not pages:
+        return []
+
+    chunks = []
+    for p in sorted(pages, key=lambda x: x.get("page_number", 0)):
+        pnum = p.get("page_number", 1)
+        content = build_page_content(p)
+        if content.strip():
+            chunks.append({
+                "chunk_id": f"{comic_id}_page_{pnum}_overview",
+                "content": content,
+                "metadata": {
+                    "comic_id": comic_id,
+                    "page_number": pnum,
+                    "chunk_index": 1
+                },
+                "distance": 0.0
+            })
+    return chunks
 
 
 def get_page_info(comic_id: str, page_number: int | None) -> tuple[str | None, dict | None]:
@@ -229,7 +278,17 @@ def answer_question(
                     seen_ids.add(cid)
                     chunks.append(chunk)
     else:
-        # Global query: retrieve semantic chunks across comic and supplement with current page
+        # If user is asking about the comic story / overall plot / summary, prioritize full comic overview
+        is_story_query = is_comic_wide_story_query(question)
+        if is_story_query:
+            overview_chunks = get_comic_overview_chunks(comic_id)
+            for chunk in overview_chunks:
+                cid = chunk.get("chunk_id")
+                if cid and cid not in seen_ids:
+                    seen_ids.add(cid)
+                    chunks.append(chunk)
+
+        # Retrieve semantic chunks across comic
         semantic_chunks = retrieve_chunks(
             query=retrieval_query,
             comic_id=comic_id,
@@ -248,7 +307,17 @@ def answer_question(
             if cid and cid not in seen_ids:
                 seen_ids.add(cid)
                 chunks.append(chunk)
-        if page_chunks:
+
+        # Fallback to overview chunks if no semantic chunks found for global query
+        if not chunks:
+            overview_chunks = get_comic_overview_chunks(comic_id)
+            for chunk in overview_chunks:
+                cid = chunk.get("chunk_id")
+                if cid and cid not in seen_ids:
+                    seen_ids.add(cid)
+                    chunks.append(chunk)
+
+        if page_chunks and not is_story_query:
             for chunk in page_chunks:
                 cid = chunk.get("chunk_id")
                 if cid and cid not in seen_ids:

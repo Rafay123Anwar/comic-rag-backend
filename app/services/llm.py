@@ -524,6 +524,24 @@ def _build_streaming_prompts(
             "Prefer a flowing narrative paragraph over bullet lists unless an explicit list was requested. Finish all thoughts and sentences completely.)"
         )
 
+    page_hint = ""
+    if current_page is not None:
+        try:
+            from app.services.rag_qa import is_page_scoped_query
+            is_page_specific = is_page_scoped_query(question, current_page)
+        except Exception:
+            is_page_specific = False
+
+        if is_page_specific:
+            page_hint = (
+                f"\nCURRENT USER VIEWING PAGE: Page {current_page}\n"
+                f"(The user is specifically asking about Page {current_page}. Keep your response strictly focused on Page {current_page} evidence.)\n"
+            )
+        else:
+            page_hint = (
+                f"\n(Note: The user is currently viewing Page {current_page}, but this question is asking about the comic's overall story, events, or characters. Synthesize the answer from all provided comic context across pages.)\n"
+            )
+
     if conversation_history:
         history_lines = []
         for msg in conversation_history:
@@ -532,10 +550,6 @@ def _build_streaming_prompts(
             if content:
                 history_lines.append(f"{role_label}: {content}")
         history_text = "\n".join(history_lines) if history_lines else "None"
-        page_hint = (
-            f"\nCURRENT USER VIEWING PAGE: Page {current_page}\n"
-            f"(The user is currently reading Page {current_page}. Keep your response strictly focused on Page {current_page} evidence and do NOT confuse it with other pages.)\n"
-        ) if current_page else ""
         user_prompt = f"""CONVERSATION HISTORY:
 {history_text}
 {page_hint}
@@ -546,10 +560,6 @@ CURRENT QUESTION:
 {question}{formatting_reminder}
 """
     else:
-        page_hint = (
-            f"\nCURRENT USER VIEWING PAGE: Page {current_page}\n"
-            f"(The user is currently reading Page {current_page}. Keep your response strictly focused on Page {current_page} evidence and do NOT confuse it with other pages.)\n"
-        ) if current_page else ""
         user_prompt = f"""{page_hint}COMIC CONTEXT:
 {context}
 
@@ -564,14 +574,15 @@ CURRENT QUESTION:
         "LANGUAGE & SCRIPT RULES\n"
         "==================================================\n"
         "1. DEFAULT LANGUAGE: Always respond in clear, fluent English by default.\n"
-        "2. ROMAN URDU SUPPORT: If the user asks in Roman Urdu (e.g. 'is page pe kya hua hai?', 'short mai batao'), respond in natural, expressive Roman Urdu using Latin alphabet (A-Z).\n"
+        "2. ROMAN URDU SUPPORT: If the user asks in Roman Urdu (e.g. 'is page pe kya hua hai?', 'short mai batao', 'story batao', 'kya story hai'), respond in natural, expressive Roman Urdu using Latin alphabet (A-Z).\n"
         "3. NO ARABIC/URDU SCRIPT: NEVER output responses in Arabic/Urdu script (اردو) unless the user explicitly wrote their question in Arabic/Urdu script.\n"
         "4. PRESERVE CHARACTER NAMES: Keep character names (e.g., 'Victor Von Doom', 'Cynthia', 'Werner', 'Hawkeye', 'Baron') in their exact standard English spelling. Never alter them.\n\n"
         "==================================================\n"
         "PAGE SCOPE & GROUNDING RULES\n"
         "==================================================\n"
-        "1. ACTIVE PAGE SCOPE: When answering questions about the active viewing page ('this page', 'here', 'scene', 'story of this page', 'who appears'), keep your answer STRICTLY focused on the provided page context. Do NOT attribute characters, dialogue, or events from other pages to the active page.\n"
-        "2. FACTUAL GROUNDING: Rely ONLY on the information explicitly provided in the COMIC CONTEXT. Never invent facts, characters, or actions not in the context. If the context does not contain enough information, reply with exactly: 'I could not find relevant information in the comic.'\n\n"
+        "1. ACTIVE PAGE SCOPE: When answering questions specifically about the active viewing page ('this page', 'here', 'scene on this page', 'who appears on this page'), keep your answer focused on that specific page. Do NOT attribute events from other pages to the active page.\n"
+        "2. COMIC STORY & OVERVIEW: When the user asks about the story of the comic, overall plot, or summary ('story kya hai', 'story batao', 'what is the story of this comic', 'summary of comic', 'in short story batao'), synthesize the story narrative across the entire comic from start to finish based on the provided COMIC CONTEXT. Do NOT just repeat a single page's visual description.\n"
+        "3. FACTUAL GROUNDING: Rely ONLY on the information explicitly provided in the COMIC CONTEXT. Never invent facts, characters, or actions not in the context. If the context does not contain enough information, reply with exactly: 'I could not find relevant information in the comic.'\n\n"
         "==================================================\n"
         "VOICE, TONE & ANSWER STYLE\n"
         "==================================================\n"

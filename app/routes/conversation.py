@@ -36,7 +36,9 @@ from app.services.rag_preprocessor import build_page_content
 from app.services.rag_qa import (
     FOLLOW_UP_INDICATORS,
     answer_question,
+    get_comic_overview_chunks,
     get_page_info,
+    is_comic_wide_story_query,
     is_page_scoped_query,
 )
 from app.services.retriever import retrieve_chunks
@@ -345,6 +347,15 @@ async def stream_in_conversation(
                         seen_ids.add(cid)
                         chunks.append(chunk)
         else:
+            is_story_query = is_comic_wide_story_query(request.question)
+            if is_story_query:
+                overview_chunks = get_comic_overview_chunks(comic_id)
+                for chunk in overview_chunks:
+                    cid = chunk.get("chunk_id")
+                    if cid and cid not in seen_ids:
+                        seen_ids.add(cid)
+                        chunks.append(chunk)
+
             semantic_chunks = retrieve_chunks(
                 query=retrieval_query,
                 comic_id=comic_id,
@@ -361,7 +372,16 @@ async def stream_in_conversation(
                 if cid and cid not in seen_ids:
                     seen_ids.add(cid)
                     chunks.append(chunk)
-            if page_chunks:
+
+            if not chunks:
+                overview_chunks = get_comic_overview_chunks(comic_id)
+                for chunk in overview_chunks:
+                    cid = chunk.get("chunk_id")
+                    if cid and cid not in seen_ids:
+                        seen_ids.add(cid)
+                        chunks.append(chunk)
+
+            if page_chunks and not is_story_query:
                 for chunk in page_chunks:
                     cid = chunk.get("chunk_id")
                     if cid and cid not in seen_ids:
