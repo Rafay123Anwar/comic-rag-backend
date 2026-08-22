@@ -1,0 +1,32 @@
+# Environment variables & secrets
+.env
+.env.local
+.env.*.local
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Temporary extraction files & uploads
+storage/temp/
+storage/uploads/
+
+# Vector database (local cache/index)
+storage/vector_db/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.tmp
+*.tmp.json
