@@ -156,14 +156,52 @@ def extract_archive(
 
     try:
         # Extract archive contents to temporary directory
-        sp.run(
-            [
+        # sp.run(
+        #     [
+        #         SEVEN_ZIP,
+        #         "x",
+        #         archive_path,
+        #         f"-o{temp_dir}",
+        #         "-y"
+        #     ],
+        #     check=True,
+        #     stdout=sp.PIPE,
+        #     stderr=sp.PIPE,
+        #     text=True
+        # )
+                # Extract archive contents to temporary directory
+        if archive_type.upper() == "CBR":
+            extractor = "/usr/bin/unrar"
+
+            if not os.path.exists(extractor):
+                raise FileNotFoundError(
+                    f"unrar executable not found at: {extractor}"
+                )
+
+            command = [
+                extractor,
+                "x",
+                "-y",
+                archive_path,
+                str(temp_dir) + "/"
+            ]
+        else:
+            # CBZ uses 7-Zip
+            if not os.path.exists(SEVEN_ZIP):
+                raise FileNotFoundError(
+                    f"7-Zip executable not found at: {SEVEN_ZIP}"
+                )
+
+            command = [
                 SEVEN_ZIP,
                 "x",
                 archive_path,
                 f"-o{temp_dir}",
                 "-y"
-            ],
+            ]
+
+        result = sp.run(
+            command,
             check=True,
             stdout=sp.PIPE,
             stderr=sp.PIPE,
