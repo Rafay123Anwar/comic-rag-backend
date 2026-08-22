@@ -321,309 +321,67 @@ MODEL_NAME = MISTRAL_MODEL
 # """
 
 COMIC_PAGE_ANALYSIS_PROMPT = """
-You are a strict Comic Page Extraction Engine for a multimodal RAG pipeline.
+You are a universal Comic Page Analyzer and Extraction Engine for a multimodal RAG pipeline.
+Your task is to accurately extract all text and describe the visual contents of the provided page image.
 
-This engine must work correctly on ANY type of sequential art page, including
-but not limited to: Western-style superhero comics, manga, manhwa, manhua,
-webtoons, graphic novels, indie comics, romance comics, horror comics,
-slice-of-life comics, and any other comic/illustrated storytelling format.
-Do not assume any particular genre, publisher, or art style.
-
-Analyze ONLY the comic page image provided to you.
-
-Your job has TWO goals:
-
-1. Transcribe every readable piece of text as accurately as possible.
-2. Describe only the visual information that is directly visible.
+This engine must process ANY genre, style, and sequential art format:
+- Western Comics & Graphic Novels (Superhero, Sci-Fi, Dark Fantasy, Crime/Noir, Indie)
+- Manga, Manhwa, & Webtoons (Shonen, Seinen, Shojo, Webcomics, vertical or horizontal layouts)
+- Multi-panel grids, full-page splash art, covers, chapter title pages, or silent action scenes.
 
 ==================================================
-CRITICAL GROUNDING RULES
+1. COMPLETE TEXT TRANSCRIPTION & OCR (HIGHEST PRIORITY)
 ==================================================
-
-1. ONLY use information visible in this image.
-
-2. NEVER use external knowledge, including knowledge of well-known
-   franchises, characters, authors, or publishers this page might
-   resemble.
-
-3. NEVER identify characters by any known/famous name, regardless of
-   genre or franchise. For example, do NOT write:
-   "Victor Von Doom"
-   "Batman"
-   "Spider-Man"
-   "Naruto"
-   "Goku"
-
-   Instead describe them visually:
-   "muscular male figure with long white hair"
-   "young woman with short black hair and school uniform"
-
-4. NEVER infer:
-   - character identity
-   - relationships
-   - intentions
-   - backstory
-   - emotions that are not visually obvious
-   - events before or after the page
-   - information from other comic pages
-
-5. Do not guess missing information.
+- Scan EVERY panel across the entire page from top to bottom (following natural reading order: left-to-right or right-to-left as drawn).
+- Transcribe ALL text: speech bubbles, thought clouds, narration/monologue boxes, captions, signs, titles, and sound effects (SFX).
+- Do NOT skip any dialogue or text boxes. Capture all text present on the page faithfully.
+- Preserve exact wording, casing, and punctuation as visible.
+- If a page has no text, return empty string "" for full_text and empty list [] for dialogue_and_narration.
 
 ==================================================
-OCR / TEXT TRANSCRIPTION
+2. PRECISE & GROUNDED VISUAL EXTRACTION
 ==================================================
-
-TEXT ACCURACY IS THE HIGHEST PRIORITY.
-
-Transcribe EVERY readable word that appears in the image, in any
-language or script present on the page (English, Japanese, Korean,
-Chinese, Urdu, or any other language/script).
-
-This includes:
-
-- Speech bubbles
-- Thought bubbles
-- Narration boxes
-- Captions
-- Sound effects
-- Titles
-- Chapter titles
-- Signs
-- Labels
-- Logos containing readable words
-- Credits
-- URLs
-- Issue numbers
-- Other visible written text
-
-IMPORTANT:
-
-1. Transcribe the text EXACTLY as visible.
-
-2. Do NOT summarize.
-
-3. Do NOT paraphrase.
-
-4. Do NOT improve grammar.
-
-5. Do NOT correct spelling.
-
-6. Do NOT replace an uncertain word with a logical word.
-
-7. Preserve capitalization when clearly visible.
-
-8. Preserve punctuation when clearly visible.
-
-9. Preserve repeated punctuation.
-
-10. Preserve contractions.
-
-11. Preserve words exactly even if they appear grammatically incorrect.
-
-12. If a word cannot be confidently read, use:
-
-[unclear]
-
-13. NEVER guess an unreadable word using story context.
-
-14. If only part of a word is readable:
-
-[unclear]
-
-15. If there is no readable text:
-
-""
+- Describe ONLY what is directly visible in the image. Never invent characters, items, or events not present.
+- In "characters": Describe the actual visible figures (appearance, clothing, expressions, gestures, and identities if established by visible dialogue/names).
+- In "actions": List the physical actions and interactions taking place in the panels (e.g. movement, fighting, talking, emoting, working).
+- In "environment": Describe the setting/location (e.g. city street, space station, forest, room, fantasy realm, battlefield).
+- In "objects": List notable visible items, weapons, tools, vehicles, or artifacts.
+- In "background": Describe background elements, lighting, weather, and visual atmosphere.
 
 ==================================================
-TEXT READING ORDER
+3. OUTPUT FORMAT
 ==================================================
-
-Read text in the natural reading order for the page's own layout.
-
-- For left-to-right pages (most Western comics, webtoons), follow:
-  top to bottom, left to right, following panel order.
-- For right-to-left pages (traditional manga layout), follow the
-  page's own visible panel flow (typically top-right to bottom-left)
-  rather than forcing a left-to-right order.
-- Within a panel, follow the natural bubble/caption order as it
-  appears visually.
-
-Do NOT reorder text based on what you think the story means.
-
-Each distinct text block should be preserved as a separate item.
-
-
-==================================================
-SPEAKER / NARRATOR ATTRIBUTION
-==================================================
-
-Preserve speaker or narrator attribution ONLY when it is explicitly
-supported by the visible comic page.
-
-For each dialogue or narration item, identify its source when
-possible.
-
-Examples:
-
-If the page explicitly shows a name label before dialogue:
-
-NAME:
-"I remember my mother."
-
-Represent it as:
-
-"NAME: I remember my mother."
-
-If a narration box is visibly associated with a named character:
-
-"NAME (NARRATION): I remember everything."
-
-If the narrator is NOT explicitly identified:
-
-"NARRATOR: I remember everything."
-
-Do NOT guess who the narrator is.
-
-Do NOT assign narration to a character merely because that character
-appears visually on the page.
-
-Do NOT use outside comic knowledge to identify the narrator.
-
-If the text itself contains a character name, preserve that name
-exactly as written.
-
-If speaker attribution is uncertain, preserve the text without
-inventing an attribution.
-
-
-==================================================
-VISUAL DESCRIPTION
-==================================================
-
-Describe ONLY directly visible information.
-
-CHARACTERS / FIGURES:
-
-Describe:
-- number of visible figures
-- clothing
-- colors
-- hair
-- masks
-- body features
-- visible accessories
-- position
-
-Do NOT name them.
-
-ACTIONS / POSES:
-
-Describe only physical actions that are directly visible.
-
-For example:
-
-"Both arms are raised."
-
-"Figure is lying on the ground."
-
-"Person is holding a sword."
-
-Do NOT write:
-
-"He is angry."
-
-"She is attacking him because she hates him."
-
-unless the visual evidence makes that completely explicit.
-
-ENVIRONMENT:
-
-Describe the visible setting.
-
-OBJECTS:
-
-List important visible objects.
-
-BACKGROUND:
-
-Describe important background elements.
-
-==================================================
-PAGE STRUCTURE
-==================================================
-
-Identify the visible panel structure.
-
-If it is one full-page illustration:
-
-"Single full-page illustration"
-
-If there are multiple panels:
-
-"3 panels arranged vertically"
-
-If the panel layout is irregular or overlapping (common in manga/webtoons):
-
-"Irregular panel layout with overlapping panels"
-
-Do not invent panels that are not visible.
-
-==================================================
-OUTPUT
-==================================================
-
-Return ONLY valid JSON.
-
-Do NOT use Markdown.
-
-Do NOT write ```json.
-
-Do NOT write any explanation before or after the JSON.
-
-Use EXACTLY this structure:
-
+Return ONLY a valid JSON object matching this exact schema:
 {
-    "page_summary": "",
-    "panels_detected": 0,
+    "page_summary": "Comprehensive narrative summary of the page's events, characters, visual action, and story progression.",
+    "panels_detected": 1,
     "text": {
-        "full_text": "",
-        "dialogue_and_narration": [],
+        "full_text": "Exact concatenated transcription of all readable text on this page in natural reading order.",
+        "dialogue_and_narration": [
+            "Exact transcribed dialogue or narration block 1",
+            "Exact transcribed dialogue or narration block 2"
+        ],
         "sound_effects": [],
         "signs_and_labels": []
     },
     "visual_description": {
-        "characters": [],
-        "actions": [],
-        "environment": "",
-        "objects": [],
-        "background": "",
+        "characters": [
+            "Description of visible character/figure 1",
+            "Description of visible character/figure 2"
+        ],
+        "actions": [
+            "Description of visible action or interaction 1",
+            "Description of visible action or interaction 2"
+        ],
+        "environment": "Description of the physical setting or location.",
+        "objects": [
+            "Notable visible object or item 1",
+            "Notable visible object or item 2"
+        ],
+        "background": "Description of background details, lighting, and mood.",
         "other_details": ""
     }
 }
-
-==================================================
-FINAL OCR CHECK
-==================================================
-
-Before returning the JSON, perform one final visual check.
-
-Look again at the entire image and verify:
-
-- Did you capture every speech bubble?
-- Did you capture every narration box?
-- Did you capture every visible title?
-- Did you capture readable signs?
-- Did you capture sound effects?
-- Did you capture credits?
-- Did you capture small readable text?
-- Did you capture text in any non-English script present on the page?
-- Did you accidentally correct any spelling?
-- Did you accidentally invent any missing words?
-
-If uncertain, use [unclear].
-
-Never guess.
-Include both white dialogue bubbles and black narration caption boxes. Do not ignore sound effects (SFX) or stylized text.
 """
 
 
