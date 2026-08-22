@@ -747,13 +747,21 @@ async def get_comic_page_image(
     pages_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Fetch exact ComicPage record from PostgreSQL
-    db_page = (
-        db.query(ComicPage)
-        .filter(ComicPage.comic_id == valid_id, ComicPage.page_number == page_number)
-        .first()
-    )
+    try:
+        db_page = (
+            db.query(ComicPage)
+            .filter(ComicPage.comic_id == valid_id, ComicPage.page_number == page_number)
+            .first()
+        )
+        exact_storage_key = (
+            db_page.image_storage_path
+            if db_page and db_page.image_storage_path
+            else None
+        )
+        page_filename = db_page.filename if db_page and db_page.filename else f"page_{page_number:03d}.jpg"
+    finally:
+        db.close()
 
-    page_filename = db_page.filename if db_page and db_page.filename else f"page_{page_number:03d}.jpg"
     image_file_path = pages_dir / page_filename
 
     # Fast path: Serve directly from local disk
@@ -784,12 +792,8 @@ async def get_comic_page_image(
 
     # 2. If missing from local disk, download exact storage path from Supabase Storage (single direct call)
     if is_supabase_storage_enabled():
-        exact_storage_key = (
-            db_page.image_storage_path
-            if db_page and db_page.image_storage_path
-            else f"user/{owner_id}/comics/{valid_id}/pages/{page_filename}"
-        )
-        downloaded_bytes = download_bytes_from_storage(exact_storage_key)
+        storage_key = exact_storage_key or f"user/{owner_id}/comics/{valid_id}/pages/{page_filename}"
+        downloaded_bytes = download_bytes_from_storage(storage_key)
         if downloaded_bytes:
             image_file_path.write_bytes(downloaded_bytes)
             media_type, _ = mimetypes.guess_type(str(image_file_path))
@@ -830,15 +834,13 @@ async def get_comic_page_thumbnail(
         )
 
     valid_id = validate_comic_id(comic_id)
-    check_comic_access(valid_id, current_user.id, db=db)
-    owner_id = get_comic_user_id(valid_id, db=db) or current_user.id
-
     thumb_dir = (Path(COMICS_DIR) / valid_id / "thumbnails").resolve()
     thumb_dir.mkdir(parents=True, exist_ok=True)
     thumb_file = thumb_dir / f"thumb_p{page_number:03d}.jpg"
 
-    # Fast path 1: Serve already-cached thumbnail directly (< 1ms)
+    # Fast path 1: Serve already-cached thumbnail directly (< 1ms) without DB query
     if thumb_file.exists() and thumb_file.stat().st_size > 0:
+        db.close()
         return FileResponse(
             str(thumb_file),
             media_type="image/jpeg",
@@ -848,20 +850,30 @@ async def get_comic_page_thumbnail(
             }
         )
 
-    # 1. Fetch exact ComicPage record
-    db_page = (
-        db.query(ComicPage)
-        .filter(ComicPage.comic_id == valid_id, ComicPage.page_number == page_number)
-        .first()
-    )
+    try:
+        check_comic_access(valid_id, current_user.id, db=db)
+        owner_id = get_comic_user_id(valid_id, db=db) or current_user.id
+
+        # 1. Fetch exact ComicPage record
+        db_page = (
+            db.query(ComicPage)
+            .filter(ComicPage.comic_id == valid_id, ComicPage.page_number == page_number)
+            .first()
+        )
+        exact_thumb_storage = (
+            db_page.thumbnail_storage_path
+            if db_page and db_page.thumbnail_storage_path
+            else None
+        )
+        page_filename = db_page.filename if db_page and db_page.filename else f"page_{page_number:03d}.jpg"
+    finally:
+        db.close()
 
     # Fast path 2: Check if source page exists on local disk and generate thumbnail on-the-fly
     pages_dir = (Path(COMICS_DIR) / valid_id / "pages").resolve()
-    page_filename = db_page.filename if db_page and db_page.filename else f"page_{page_number:03d}.jpg"
     source_img_path = pages_dir / page_filename
 
     if not source_img_path.exists():
-        # Check standard name
         for alt_name in [f"page_{page_number:03d}.jpg", f"page_{page_number:03d}.png", f"page_{page_number:03d}.webp"]:
             alt_p = pages_dir / alt_name
             if alt_p.exists() and alt_p.stat().st_size > 0:
@@ -882,11 +894,7 @@ async def get_comic_page_thumbnail(
 
     # Fast path 3: Supabase Storage single direct download for exact thumbnail path
     if is_supabase_storage_enabled():
-        exact_thumb_key = (
-            db_page.thumbnail_storage_path
-            if db_page and db_page.thumbnail_storage_path
-            else f"user/{owner_id}/comics/{valid_id}/thumbnails/thumb_p{page_number:03d}.jpg"
-        )
+        exact_thumb_key = exact_thumb_storage or f"user/{owner_id}/comics/{valid_id}/thumbnails/thumb_p{page_number:03d}.jpg"
         thumb_bytes = download_bytes_from_storage(exact_thumb_key)
         if thumb_bytes:
             thumb_file.write_bytes(thumb_bytes)
