@@ -1,3 +1,4 @@
+from fastapi import responses
 import base64
 import io
 import json
@@ -385,7 +386,24 @@ MODEL_NAME = MISTRAL_MODEL
 # """
 
 COMIC_PAGE_ANALYSIS_PROMPT = """
-...
+NOTE: The image(s) provided may be sequential top-to-bottom slices of a SINGLE tall comic page
+(with slight overlap between slices). If multiple images are given, treat them together as ONE
+continuous page — do not treat slices as separate pages or invent extra panels just because the
+page was sliced.
+
+You are a universal Comic Page Analyzer and Extraction Engine for a multimodal RAG pipeline.
+Your task is to accurately extract all text and describe the visual contents of the provided page image.
+
+# ==================================================
+# 1. COMPLETE TEXT TRANSCRIPTION & OCR (HIGHEST PRIORITY)
+# ==================================================
+# - Scan EVERY panel across the entire page from top to bottom (following natural reading order: left-to-right or right-to-left as drawn).
+# - Transcribe ALL text: speech bubbles, thought clouds, narration/monologue boxes, captions, signs, titles, and sound effects (SFX).
+# - Do NOT skip any dialogue or text boxes. Capture all text present on the page faithfully.
+# - Preserve exact wording, casing, and punctuation as visible.
+# - If a page has no text, return empty string "" for full_text and empty list [] for dialogue_and_narration.
+
+
 ==================================================
 2. PRECISE & GROUNDED VISUAL EXTRACTION (PANEL-SCOPED)
 ==================================================
@@ -711,6 +729,49 @@ def _encode_and_scale_image(image_path: str, max_dimension: int = 1600, quality:
 _easyocr_reader = None
 _easyocr_lock = threading.Lock()
 
+# 👇 YAHAN NAYA FUNCTION ADD KARO (existing function ke turant baad)
+def _encode_and_scale_image_tiles(image_path: str, max_dimension: int = 1568, quality: int = 85) -> list[str]:
+    """
+    Splits a tall/wide comic page into near-square, overlapping tiles
+    (per Mistral's 1:1 aspect ratio recommendation) and returns a list
+    of base64-encoded JPEG tiles, ordered top-to-bottom.
+    """
+    with Image.open(image_path) as img:
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+
+        w, h = img.size
+        aspect = h / w
+
+        if aspect <= 1.3:
+            return [_encode_and_scale_image(image_path, max_dimension, quality)]
+
+        tile_height = w
+        overlap = int(tile_height * 0.15)
+        tiles = []
+        y = 0
+        while y < h:
+            box = (0, y, w, min(y + tile_height, h))
+            tile = img.crop(box)
+            buffer = io.BytesIO()
+
+            tw, th = tile.size
+            longest = max(tw, th)
+            if longest > max_dimension:
+                scale = max_dimension / float(longest)
+                tile = tile.resize(
+                    (max(1, int(tw * scale)), max(1, int(th * scale))),
+                    Image.Resampling.LANCZOS
+                )
+
+            tile.save(buffer, format="JPEG", quality=quality, optimize=True)
+            tiles.append(base64.b64encode(buffer.getvalue()).decode("utf-8"))
+
+            if y + tile_height >= h:
+                break
+            y += tile_height - overlap
+
+        return tiles
 
 def get_easyocr_reader():
     """Lazy-loads EasyOCR Reader instance thread-safely."""
@@ -760,7 +821,7 @@ def analyze_page(image_path: str, draft_ocr: str = "") -> dict:
 
     image_base64 = _encode_and_scale_image(
         image_path,
-        max_dimension=1600,
+        max_dimension=1568,
         quality=85
     )
 
@@ -778,28 +839,46 @@ def analyze_page(image_path: str, draft_ocr: str = "") -> dict:
     else:
         prompt_text = COMIC_PAGE_ANALYSIS_PROMPT
 
+    # response = client.chat.complete(
+    #     model=MODEL_NAME,
+    #     messages=[
+    #         {
+    #             "role": "user",
+    #             "content": [
+    #                 {
+    #                     "type": "text",
+    #                     "text": prompt_text
+    #                 },
+    #                 {
+    #                     "type": "image_url",
+    #                     "image_url": {
+    #                         "url": f"data:image/jpeg;base64,{image_base64}"
+    #                     }
+    #                 }
+    #             ]
+    #         }
+    #     ],
+    #     temperature=0.1,
+    # )
+    image_tiles_base64 = _encode_and_scale_image_tiles(image_path, max_dimension=1568, quality=85)
+
+    content_blocks = [{"type": "text", "text": prompt_text}]
+    for tile_b64 in image_tiles_base64:
+        content_blocks.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{tile_b64}"}
+        })
+
     response = client.chat.complete(
         model=MODEL_NAME,
         messages=[
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": prompt_text
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{image_base64}"
-                        }
-                    }
-                ]
+                "content": content_blocks
             }
         ],
         temperature=0.1,
     )
-
     raw_result = response.choices[0].message.content
 
     # Convert AI response to JSON
