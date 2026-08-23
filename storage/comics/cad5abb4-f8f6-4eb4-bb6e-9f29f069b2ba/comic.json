@@ -1,0 +1,146 @@
+{
+    "comic": {
+        "id": "cad5abb4-f8f6-4eb4-bb6e-9f29f069b2ba",
+        "name": "Books of Doom 001-003",
+        "source_format": "jpg",
+        "total_pages": 1,
+        "status": "completed",
+        "analyzed_pages": 1,
+        "successful_pages": 1,
+        "failed_pages": 0,
+        "user_id": "1562ded7-59a9-4740-9608-56c99ad0240f"
+    },
+    "comic_content": {
+        "full_text": "PAGE 1\nFATHER NEVER BELIEVED ME, BUT I SWEAR THAT MY AWARENESS BEGAN IN MY MOTHER'S WOMB.\n\nPERHAPS IT WAS THE DEMONS MOTHER WAS DALLYING WITH THAT MADE THIS POSSIBLE.\n\nPERHAPS IT WAS THEIR TOUCH THAT OPENED MY MIND TOO CLEARLY AND TOO EARLY.\n\nIF ONLY I COULD HAVE KNOWN WHY HER HANDS WERE ALWAYS SO COLD.\n\nBUT REGARDLESS, WHILE FATHER COULDN'T BELIEVE MY STORIES, MOTHER NEVER DOUBTED ME FOR A MOMENT.\n\nOF COURSE, MY LOVELY VICTOR. YOU'RE NOT LIKE OTHER BOYS. MOMMA KNOWS THAT.\n\nMOTHER'S LOVING ARMS. HOW I LIVED FOR HER EMBRACE, AS ALL BOYS DO."
+    },
+    "pages": [
+        {
+            "page_number": 1,
+            "filename": "page_001.jpg",
+            "image_path": "storage\\comics\\cad5abb4-f8f6-4eb4-bb6e-9f29f069b2ba\\pages\\page_001.jpg",
+            "analysis": {
+                "page_summary": "A comic page depicting a nighttime outdoor encampment where a pregnant woman dances around a bonfire for an audience, an inset of an unborn baby in the womb, and subsequent panels showing an affectionate mother embracing a young boy indoors.",
+                "panels_detected": 5,
+                "panels": [
+                    {
+                        "panel_index": 1,
+                        "characters": [
+                            "A pregnant woman with long dark hair, wearing a white top, a green sash, and a floral patterned skirt, dancing joyfully with outstretched arms.",
+                            "A crowd of men, women, and children of various ages gathered in a semicircle around the fire, clapping, smiling, and observing.",
+                            "A man sitting on the ground to the right of the fire, wearing a pinkish-orange shirt and trousers.",
+                            "A man playing a hand drum among the crowd on the left."
+                        ],
+                        "actions": [
+                            "The pregnant woman dances before a roaring bonfire.",
+                            "The surrounding crowd claps and watches the dance.",
+                            "A musician beats on a drum."
+                        ],
+                        "environment": "An outdoor rural encampment at night with wooden traveling wagons, mountains in the distance, and a starry night sky with a crescent moon.",
+                        "objects": [
+                            "Bonfire",
+                            "Hand drum",
+                            "Wooden caravans/wagons"
+                        ]
+                    },
+                    {
+                        "panel_index": 2,
+                        "characters": [
+                            "A developing fetus/infant rendered in monochromatic red-orange tones, curled with its hands near its mouth."
+                        ],
+                        "actions": [
+                            "The unborn baby rests curled inside the womb."
+                        ],
+                        "environment": "An abstract biological interior representing a womb.",
+                        "objects": []
+                    },
+                    {
+                        "panel_index": 3,
+                        "characters": [
+                            "A woman with brown hair and an earring, wearing a light-colored sleeveless top, smiling warmly.",
+                            "A young boy with short brown hair wearing a light long-sleeve shirt, held in her lap."
+                        ],
+                        "actions": [
+                            "The woman holds the young boy lovingly in her arms while looking down at him with a smile."
+                        ],
+                        "environment": "A wooden interior room.",
+                        "objects": []
+                    },
+                    {
+                        "panel_index": 4,
+                        "characters": [
+                            "A brown-haired woman embracing a child.",
+                            "A young boy resting his head peacefully against the woman's shoulder/chest."
+                        ],
+                        "actions": [
+                            "The mother and child hug tightly in a warm embrace."
+                        ],
+                        "environment": "A rustic wooden room with a small square window in the background.",
+                        "objects": [
+                            "Small window"
+                        ]
+                    },
+                    {
+                        "panel_index": 5,
+                        "characters": [
+                            "Close-up of the woman's face, showing her dark eyes, gentle smile, and brown hair looking downward."
+                        ],
+                        "actions": [
+                            "The woman looks down tenderly at the child resting against her."
+                        ],
+                        "environment": "Close-up perspective with minimal background detail.",
+                        "objects": []
+                    }
+                ],
+                "text": {
+                    "full_text": "FATHER NEVER BELIEVED ME, BUT I SWEAR THAT MY AWARENESS BEGAN IN MY MOTHER'S WOMB. PERHAPS IT WAS THE DEMONS MOTHER WAS DALLYING WITH THAT MADE THIS POSSIBLE. PERHAPS IT WAS THEIR TOUCH THAT OPENED MY MIND TOO CLEARLY AND TOO EARLY. PERHAPS IT WAS THEIR TOUCH THAT OPENED MY MIND TOO CLEARLY AND TOO EARLY. IF ONLY I COULD HAVE KNOWN WHY HER HANDS WERE ALWAYS SO COLD. BUT REGARDLESS, WHILE FATHER COULDN'T BELIEVE MY STORIES, MOTHER NEVER DOUBTED ME FOR A MOMENT. OF COURSE, MY LOVELY VICTOR. YOU'RE NOT LIKE OTHER BOYS. MOMMA KNOWS THAT. MOTHER'S LOVING ARMS. HOW I LIVED FOR HER EMBRACE, AS ALL BOYS DO.",
+                    "dialogue_and_narration": [
+                        "FATHER NEVER BELIEVED ME, BUT I SWEAR THAT MY AWARENESS BEGAN IN MY MOTHER'S WOMB.",
+                        "PERHAPS IT WAS THE DEMONS MOTHER WAS DALLYING WITH THAT MADE THIS POSSIBLE.",
+                        "PERHAPS IT WAS THEIR TOUCH THAT OPENED MY MIND TOO CLEARLY AND TOO EARLY.",
+                        "IF ONLY I COULD HAVE KNOWN WHY HER HANDS WERE ALWAYS SO COLD.",
+                        "BUT REGARDLESS, WHILE FATHER COULDN'T BELIEVE MY STORIES, MOTHER NEVER DOUBTED ME FOR A MOMENT.",
+                        "OF COURSE, MY LOVELY VICTOR. YOU'RE NOT LIKE OTHER BOYS. MOMMA KNOWS THAT.",
+                        "MOTHER'S LOVING ARMS. HOW I LIVED FOR HER EMBRACE, AS ALL BOYS DO."
+                    ],
+                    "sound_effects": [],
+                    "signs_and_labels": []
+                },
+                "visual_description": {
+                    "characters": [
+                        "Pregnant woman with long dark hair in a floral skirt and green sash.",
+                        "Young boy with short brown hair in a long-sleeved light top.",
+                        "Mother figure with brown hair, hoop earring, and a gentle expression.",
+                        "Developing infant depicted in red-orange hues.",
+                        "Crowd of onlookers including men, women, and children in traditional rural attire."
+                    ],
+                    "actions": [
+                        "Dancing around a bright bonfire at night.",
+                        "Clapping and drumming along to music.",
+                        "Tenderly holding and hugging a young child indoors."
+                    ],
+                    "environment": "Outdoor nighttime encampment with wooden wagons under a starry sky, transitioning to an abstract womb view, and then to a cozy wooden rustic interior.",
+                    "objects": [
+                        "Bonfire",
+                        "Hand drum",
+                        "Wooden wagons/caravans",
+                        "Small window"
+                    ],
+                    "background": "Nighttime mountains and starry sky with moon in the top panel; warm wooden walls in the lower panels.",
+                    "other_details": "Warm and nostalgic visual tone focusing on motherhood, family, and early memories."
+                }
+            },
+            "metadata": {
+                "page_number": 1,
+                "has_text": true
+            },
+            "status": "success",
+            "perf": {
+                "duration": 29.71238829998765,
+                "attempts": 1,
+                "retry_wait": 1.1899974197149277e-05
+            },
+            "image_storage_path": "user/1562ded7-59a9-4740-9608-56c99ad0240f/comics/cad5abb4-f8f6-4eb4-bb6e-9f29f069b2ba/pages/page_001.jpg",
+            "thumbnail_storage_path": "user/1562ded7-59a9-4740-9608-56c99ad0240f/comics/cad5abb4-f8f6-4eb4-bb6e-9f29f069b2ba/thumbnails/thumb_p001.jpg"
+        }
+    ]
+}

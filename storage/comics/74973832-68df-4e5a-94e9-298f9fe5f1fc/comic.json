@@ -1,0 +1,115 @@
+{
+    "comic": {
+        "id": "74973832-68df-4e5a-94e9-298f9fe5f1fc",
+        "name": "Books of Doom 001-003",
+        "source_format": "jpg",
+        "total_pages": 1,
+        "status": "completed",
+        "analyzed_pages": 1,
+        "successful_pages": 1,
+        "failed_pages": 0,
+        "user_id": "1562ded7-59a9-4740-9608-56c99ad0240f"
+    },
+    "comic_content": {
+        "full_text": "PAGE 1\nFATHER NEVER BELIEVED ME, BUT I SWEAR THAT MY AWARENESS BEGAN IN MY MOTHER'S WOMB.\n\nPERHAPS IT WAS THE DEMONS MOTHER WAS DALYING WITH THAT MADE THIS POSSIBLE.\n\nPERHAPS IT WAS THEIR TOUCH THAT OPENED MY MIND TOO CLEARLY AND TOO EARLY.\n\nIF ONLY I COULD HAVE KNOWN WHY HER HANDS WERE ALWAYS SO COLD.\n\nBUT REGARDLESS, WHILE FATHER COULDN'T BELIEVE MY STORIES, MOTHER NEVER DOUBTED ME FOR A MOMENT.\n\nOF COURSE, MY LOVELY VICTOR. YOU'RE NOT LIKE OTHER BOYS. MOMMA KNOWS THAT.\n\nMOTHER'S LOVING ARMS. HOW I LIVED FOR HER EMBRACE, AS ALL BOYS DO."
+    },
+    "pages": [
+        {
+            "page_number": 1,
+            "filename": "page_001.jpg",
+            "image_path": "storage\\comics\\74973832-68df-4e5a-94e9-298f9fe5f1fc\\pages\\page_001.jpg",
+            "analysis": {
+                "page_summary": "The page depicts a surreal and introspective narrative about the protagonist's early awareness and relationship with their parents. The first half shows a fantastical scene where a large group of people is gathered around a central figure pouring a glowing liquid from a giant jug into a fire, creating an ethereal and celebratory atmosphere. The protagonist reflects on their unusual awareness starting from their mother's womb and speculates about supernatural influences. The second half shifts to intimate moments with their mother, highlighting her unconditional belief and love, contrasted with the father's skepticism. The protagonist expresses regret over not understanding their mother's cold hands.",
+                "panels_detected": 1,
+                "panels": [
+                    {
+                        "panel_index": 1,
+                        "dialogue_and_narration": [
+                            "FATHER NEVER BELIEVED ME, BUT I SWEAR THAT MY AWARENESS BEGAN IN MY MOTHER'S WOMB.",
+                            "PERHAPS IT WAS THE DEMONS MOTHER WAS DALYING WITH THAT MADE THIS POSSIBLE.",
+                            "PERHAPS IT WAS THEIR TOUCH THAT OPENED MY MIND TOO CLEARLY AND TOO EARLY.",
+                            "IF ONLY I COULD HAVE KNOWN WHY HER HANDS WERE ALWAYS SO COLD.",
+                            "BUT REGARDLESS, WHILE FATHER COULDN'T BELIEVE MY STORIES, MOTHER NEVER DOUBTED ME FOR A MOMENT.",
+                            "OF COURSE, MY LOVELY VICTOR. YOU'RE NOT LIKE OTHER BOYS. MOMMA KNOWS THAT.",
+                            "MOTHER'S LOVING ARMS. HOW I LIVED FOR HER EMBRACE, AS ALL BOYS DO."
+                        ],
+                        "characters": [
+                            "A large group of people, dressed in ancient or tribal clothing, gathered around a central figure pouring liquid from a giant jug into a fire. The crowd appears joyful and engaged.",
+                            "A central female figure in ornate, flowing attire, dancing or celebrating near the fire. She has long dark hair and is adorned with jewelry.",
+                            "A young boy in the foreground with short hair, smiling and raising his hand toward the central figure.",
+                            "A woman with long brown hair, sitting and holding a young boy (Victor) in a tender embrace. She is smiling warmly.",
+                            "The same young boy (Victor), now older, sitting on the woman's lap, looking content and assured.",
+                            "A close-up of a male figure with dark hair and sharp features, looking concerned or introspective."
+                        ],
+                        "actions": [
+                            "A central figure pours a glowing liquid from a giant jug into a fire, creating a bright and dramatic effect.",
+                            "The crowd of people is clapping, smiling, and engaging in a celebratory manner around the fire.",
+                            "The young boy in the foreground waves or reaches out toward the central figure.",
+                            "The woman embraces the young boy (Victor) affectionately, holding him close.",
+                            "The older Victor sits on the woman's lap, engaging in conversation with her."
+                        ],
+                        "environment": "The scene appears to be set in an ancient or tribal village during nighttime. There is a large wooden structure resembling a temple or communal building in the background, surrounded by trees and mountains. The second half shifts to an indoor setting with wooden walls and a warm, intimate atmosphere.",
+                        "objects": [
+                            "A giant jug from which a glowing liquid is poured.",
+                            "A fire with embers rising into the air.",
+                            "Drums and other musical instruments held by some members of the crowd.",
+                            "Jewelry and ornate clothing worn by the central female figure."
+                        ]
+                    }
+                ],
+                "text": {
+                    "full_text": "FATHER NEVER BELIEVED ME, BUT I SWEAR THAT MY AWARENESS BEGAN IN MY MOTHER'S WOMB. PERHAPS IT WAS THE DEMONS MOTHER WAS DALYING WITH THAT MADE THIS POSSIBLE. PERHAPS IT WAS THEIR TOUCH THAT OPENED MY MIND TOO CLEARLY AND TOO EARLY. IF ONLY I COULD HAVE KNOWN WHY HER HANDS WERE ALWAYS SO COLD. BUT REGARDLESS, WHILE FATHER COULDN'T BELIEVE MY STORIES, MOTHER NEVER DOUBTED ME FOR A MOMENT. OF COURSE, MY LOVELY VICTOR. YOU'RE NOT LIKE OTHER BOYS. MOMMA KNOWS THAT. MOTHER'S LOVING ARMS. HOW I LIVED FOR HER EMBRACE, AS ALL BOYS DO.",
+                    "dialogue_and_narration": [
+                        "FATHER NEVER BELIEVED ME, BUT I SWEAR THAT MY AWARENESS BEGAN IN MY MOTHER'S WOMB.",
+                        "PERHAPS IT WAS THE DEMONS MOTHER WAS DALYING WITH THAT MADE THIS POSSIBLE.",
+                        "PERHAPS IT WAS THEIR TOUCH THAT OPENED MY MIND TOO CLEARLY AND TOO EARLY.",
+                        "IF ONLY I COULD HAVE KNOWN WHY HER HANDS WERE ALWAYS SO COLD.",
+                        "BUT REGARDLESS, WHILE FATHER COULDN'T BELIEVE MY STORIES, MOTHER NEVER DOUBTED ME FOR A MOMENT.",
+                        "OF COURSE, MY LOVELY VICTOR. YOU'RE NOT LIKE OTHER BOYS. MOMMA KNOWS THAT.",
+                        "MOTHER'S LOVING ARMS. HOW I LIVED FOR HER EMBRACE, AS ALL BOYS DO."
+                    ],
+                    "sound_effects": [],
+                    "signs_and_labels": []
+                },
+                "visual_description": {
+                    "characters": [
+                        "A large crowd of people dressed in ancient or tribal clothing, appearing joyful and engaged in a celebration.",
+                        "A central female figure in ornate, flowing attire with long dark hair, dancing or celebrating near a fire.",
+                        "A young boy in the foreground with short hair, smiling and raising his hand toward the central figure.",
+                        "A woman with long brown hair, sitting and holding a young boy (Victor) in a warm embrace.",
+                        "An older version of Victor, sitting on the woman's lap, looking content and engaged in conversation.",
+                        "A close-up of a male figure with sharp features, looking concerned or introspective."
+                    ],
+                    "actions": [
+                        "A central figure pours a glowing liquid from a giant jug into a fire, creating a bright and dramatic effect.",
+                        "The crowd claps, smiles, and celebrates around the fire.",
+                        "The young boy waves or reaches out toward the central figure.",
+                        "The woman embraces Victor affectionately.",
+                        "Victor sits on the woman's lap, engaging in conversation."
+                    ],
+                    "environment": "The first part of the page depicts an outdoor nighttime scene in an ancient or tribal village with a large wooden structure in the background. The second part shifts to an indoor setting with wooden walls and a warm, intimate atmosphere.",
+                    "objects": [
+                        "A giant jug from which a glowing liquid is poured.",
+                        "A fire with embers rising into the air.",
+                        "Drums and other musical instruments held by members of the crowd.",
+                        "Jewelry and ornate clothing worn by the central female figure."
+                    ],
+                    "background": "The outdoor scene features a night sky with stars, trees, and mountains in the distance. The indoor scene has warm lighting, wooden walls, and a cozy atmosphere.",
+                    "other_details": ""
+                }
+            },
+            "metadata": {
+                "page_number": 1,
+                "has_text": true
+            },
+            "status": "success",
+            "perf": {
+                "duration": 53.45953400002327,
+                "attempts": 1,
+                "retry_wait": 1.3299984857439995e-05
+            },
+            "image_storage_path": "user/1562ded7-59a9-4740-9608-56c99ad0240f/comics/74973832-68df-4e5a-94e9-298f9fe5f1fc/pages/page_001.jpg",
+            "thumbnail_storage_path": "user/1562ded7-59a9-4740-9608-56c99ad0240f/comics/74973832-68df-4e5a-94e9-298f9fe5f1fc/thumbnails/thumb_p001.jpg"
+        }
+    ]
+}

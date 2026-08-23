@@ -1,0 +1,36 @@
+{
+    "comic": {
+        "id": "dcf5e019-e4cb-400b-a5da-87f9d9203cce",
+        "name": "Books of Doom 001-003",
+        "source_format": "jpg",
+        "total_pages": 1,
+        "status": "failed",
+        "analyzed_pages": 1,
+        "successful_pages": 0,
+        "failed_pages": 1,
+        "user_id": "1562ded7-59a9-4740-9608-56c99ad0240f"
+    },
+    "comic_content": {
+        "full_text": ""
+    },
+    "pages": [
+        {
+            "page_number": 1,
+            "filename": "page_001.jpg",
+            "image_path": "storage\\comics\\dcf5e019-e4cb-400b-a5da-87f9d9203cce\\pages\\page_001.jpg",
+            "analysis": null,
+            "metadata": {
+                "page_number": 1
+            },
+            "status": "error",
+            "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}",
+            "perf": {
+                "duration": 71.68049559998326,
+                "attempts": 6,
+                "retry_wait": 8.894358900259249
+            },
+            "image_storage_path": "user/1562ded7-59a9-4740-9608-56c99ad0240f/comics/dcf5e019-e4cb-400b-a5da-87f9d9203cce/pages/page_001.jpg",
+            "thumbnail_storage_path": "user/1562ded7-59a9-4740-9608-56c99ad0240f/comics/dcf5e019-e4cb-400b-a5da-87f9d9203cce/thumbnails/thumb_p001.jpg"
+        }
+    ]
+}
