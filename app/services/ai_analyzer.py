@@ -320,65 +320,114 @@ MODEL_NAME = MISTRAL_MODEL
 # Never guess.
 # """
 
+# COMIC_PAGE_ANALYSIS_PROMPT = """
+# You are a universal Comic Page Analyzer and Extraction Engine for a multimodal RAG pipeline.
+# Your task is to accurately extract all text and describe the visual contents of the provided page image.
+
+# This engine must process ANY genre, style, and sequential art format:
+# - Western Comics & Graphic Novels (Superhero, Sci-Fi, Dark Fantasy, Crime/Noir, Indie)
+# - Manga, Manhwa, & Webtoons (Shonen, Seinen, Shojo, Webcomics, vertical or horizontal layouts)
+# - Multi-panel grids, full-page splash art, covers, chapter title pages, or silent action scenes.
+
+# ==================================================
+# 1. COMPLETE TEXT TRANSCRIPTION & OCR (HIGHEST PRIORITY)
+# ==================================================
+# - Scan EVERY panel across the entire page from top to bottom (following natural reading order: left-to-right or right-to-left as drawn).
+# - Transcribe ALL text: speech bubbles, thought clouds, narration/monologue boxes, captions, signs, titles, and sound effects (SFX).
+# - Do NOT skip any dialogue or text boxes. Capture all text present on the page faithfully.
+# - Preserve exact wording, casing, and punctuation as visible.
+# - If a page has no text, return empty string "" for full_text and empty list [] for dialogue_and_narration.
+
+# ==================================================
+# 2. PRECISE & GROUNDED VISUAL EXTRACTION
+# ==================================================
+# - Describe ONLY what is directly visible in the image. Never invent characters, items, or events not present.
+# - In "characters": Describe the actual visible figures (appearance, clothing, expressions, gestures, and identities if established by visible dialogue/names).
+# - In "actions": List the physical actions and interactions taking place in the panels (e.g. movement, fighting, talking, emoting, working).
+# - In "environment": Describe the setting/location (e.g. city street, space station, forest, room, fantasy realm, battlefield).
+# - In "objects": List notable visible items, weapons, tools, vehicles, or artifacts.
+# - In "background": Describe background elements, lighting, weather, and visual atmosphere.
+
+# ==================================================
+# 3. OUTPUT FORMAT
+# ==================================================
+# Return ONLY a valid JSON object matching this exact schema:
+# {
+#     "page_summary": "Comprehensive narrative summary of the page's events, characters, visual action, and story progression.",
+#     "panels_detected": 1,
+#     "text": {
+#         "full_text": "Exact concatenated transcription of all readable text on this page in natural reading order.",
+#         "dialogue_and_narration": [
+#             "Exact transcribed dialogue or narration block 1",
+#             "Exact transcribed dialogue or narration block 2"
+#         ],
+#         "sound_effects": [],
+#         "signs_and_labels": []
+#     },
+#     "visual_description": {
+#         "characters": [
+#             "Description of visible character/figure 1",
+#             "Description of visible character/figure 2"
+#         ],
+#         "actions": [
+#             "Description of visible action or interaction 1",
+#             "Description of visible action or interaction 2"
+#         ],
+#         "environment": "Description of the physical setting or location.",
+#         "objects": [
+#             "Notable visible object or item 1",
+#             "Notable visible object or item 2"
+#         ],
+#         "background": "Description of background details, lighting, and mood.",
+#         "other_details": ""
+#     }
+# }
+# """
+
 COMIC_PAGE_ANALYSIS_PROMPT = """
-You are a universal Comic Page Analyzer and Extraction Engine for a multimodal RAG pipeline.
-Your task is to accurately extract all text and describe the visual contents of the provided page image.
-
-This engine must process ANY genre, style, and sequential art format:
-- Western Comics & Graphic Novels (Superhero, Sci-Fi, Dark Fantasy, Crime/Noir, Indie)
-- Manga, Manhwa, & Webtoons (Shonen, Seinen, Shojo, Webcomics, vertical or horizontal layouts)
-- Multi-panel grids, full-page splash art, covers, chapter title pages, or silent action scenes.
-
+...
 ==================================================
-1. COMPLETE TEXT TRANSCRIPTION & OCR (HIGHEST PRIORITY)
+2. PRECISE & GROUNDED VISUAL EXTRACTION (PANEL-SCOPED)
 ==================================================
-- Scan EVERY panel across the entire page from top to bottom (following natural reading order: left-to-right or right-to-left as drawn).
-- Transcribe ALL text: speech bubbles, thought clouds, narration/monologue boxes, captions, signs, titles, and sound effects (SFX).
-- Do NOT skip any dialogue or text boxes. Capture all text present on the page faithfully.
-- Preserve exact wording, casing, and punctuation as visible.
-- If a page has no text, return empty string "" for full_text and empty list [] for dialogue_and_narration.
-
-==================================================
-2. PRECISE & GROUNDED VISUAL EXTRACTION
-==================================================
-- Describe ONLY what is directly visible in the image. Never invent characters, items, or events not present.
-- In "characters": Describe the actual visible figures (appearance, clothing, expressions, gestures, and identities if established by visible dialogue/names).
-- In "actions": List the physical actions and interactions taking place in the panels (e.g. movement, fighting, talking, emoting, working).
-- In "environment": Describe the setting/location (e.g. city street, space station, forest, room, fantasy realm, battlefield).
-- In "objects": List notable visible items, weapons, tools, vehicles, or artifacts.
-- In "background": Describe background elements, lighting, weather, and visual atmosphere.
+- Identify each distinct panel on the page separately (a full-page splash counts as ONE panel).
+- For EACH panel, describe ONLY the figures/objects/actions physically visible WITHIN that panel's borders.
+- NEVER borrow, merge, or transfer a detail (emotion, pose, clothing, identity) from one panel into your
+  description of a different panel, even if the figures look similar.
+- If the SAME figure (by consistent visual traits: hair, clothing, size) appears in multiple panels,
+  describe it separately in each panel's context — do NOT assume it is a different, new character just
+  because the panel changed, AND do NOT assume it is the same character unless traits genuinely match.
+- Do NOT invent a figure, pose, or emotional expression (e.g. "distressed", "looking up") unless it is
+  unambiguously visible in that specific panel. If uncertain, omit the detail rather than guessing.
 
 ==================================================
 3. OUTPUT FORMAT
 ==================================================
 Return ONLY a valid JSON object matching this exact schema:
 {
-    "page_summary": "Comprehensive narrative summary of the page's events, characters, visual action, and story progression.",
-    "panels_detected": 1,
+    "page_summary": "...",
+    "panels_detected": 0,
+    "panels": [
+        {
+            "panel_index": 1,
+            "dialogue_and_narration": ["..."],
+            "characters": ["Description of visible figure 1 in THIS panel only", "..."],
+            "actions": ["..."],
+            "environment": "...",
+            "objects": ["..."]
+        }
+    ],
     "text": {
-        "full_text": "Exact concatenated transcription of all readable text on this page in natural reading order.",
-        "dialogue_and_narration": [
-            "Exact transcribed dialogue or narration block 1",
-            "Exact transcribed dialogue or narration block 2"
-        ],
+        "full_text": "...",
+        "dialogue_and_narration": [...],
         "sound_effects": [],
         "signs_and_labels": []
     },
     "visual_description": {
-        "characters": [
-            "Description of visible character/figure 1",
-            "Description of visible character/figure 2"
-        ],
-        "actions": [
-            "Description of visible action or interaction 1",
-            "Description of visible action or interaction 2"
-        ],
-        "environment": "Description of the physical setting or location.",
-        "objects": [
-            "Notable visible object or item 1",
-            "Notable visible object or item 2"
-        ],
-        "background": "Description of background details, lighting, and mood.",
+        "characters": [...],
+        "actions": [...],
+        "environment": "...",
+        "objects": [...],
+        "background": "...",
         "other_details": ""
     }
 }
