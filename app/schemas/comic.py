@@ -37,6 +37,14 @@ class ComicUploadResponse(BaseModel):
     rag_error: str | None = Field(default=None, description="Error message if RAG ingestion failed")
 
 
+class ComicStatusPageItem(BaseModel):
+    page_number: int = Field(description="1-indexed page number")
+    image_url: str | None = Field(default=None, description="Signed or direct URL for page image")
+    thumbnail_url: str | None = Field(default=None, description="Signed or direct URL for page thumbnail")
+    status: str = Field(default="processing", description="Page status: 'processing', 'success', 'error'")
+    analysis: dict | None = Field(default=None, description="Extracted analysis JSON for the page")
+
+
 class ComicStatusResponse(BaseModel):
     comic_id: str = Field(description="Comic identifier")
     title: str = Field(default="", description="Comic title")
@@ -46,6 +54,7 @@ class ComicStatusResponse(BaseModel):
     successful_pages: int = Field(default=0, description="Number of successfully analyzed pages")
     failed_pages: int = Field(default=0, description="Number of failed pages")
     rag_ingested: bool = Field(default=False, description="Whether RAG vector ingestion is complete")
+    pages: list[ComicStatusPageItem] = Field(default_factory=list, description="Extracted pages with image_url and thumbnail_url")
 
 
 class ComicListItem(BaseModel):

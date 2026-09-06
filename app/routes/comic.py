@@ -3,6 +3,8 @@ Comic Routes
 
 API endpoints for comic upload, metadata retrieval, and question-answering.
 """
+import asyncio
+import concurrent.futures
 import json
 import mimetypes
 import shutil
@@ -66,6 +68,7 @@ from app.services.storage import (
     list_all_comics,
     save_comic_json,
     sync_comic_assets_to_supabase,
+    upload_comic_assets_immediately,
 )
 from app.services.vector_store import delete_chunks_by_comic_id
 
@@ -85,13 +88,17 @@ def run_background_comic_analysis(
     comic_name: str,
     source_format: str,
     initial_pages: list[dict] | None = None,
-    user_id: str | None = None
+    user_id: str | None = None,
+    original_file_path: Path | None = None
 ):
     """
-    Executes visual AI analysis and asset delivery pipeline in the background.
-    Lifecycle per page:
-      AI analysis -> thumbnail generation -> image upload -> thumbnail upload -> database save -> COMPLETE -> non-blocking RAG.
-    Guarantees independent exception boundaries, verified storage paths, and 100% progress completion.
+    Executes the optimized concurrent background comic processing pipeline:
+      1. Launch Supabase Storage asset upload AND EdenAI multimodal visual analysis CONCURRENTLY.
+      2. AI analysis begins immediately at t=0 since local page images are already extracted on disk.
+      3. As EdenAI analyzes each page, incremental analysis results are persisted to DB/json and ingested into RAG.
+      4. As Supabase uploads page images/thumbnails and fetches signed CDN URLs, URLs are persisted to DB/json.
+      5. Full comic chunking and ChromaDB / vector store ingestion runs when analysis completes.
+      6. Finally, updates the database status to 'completed'.
     """
     with _active_comic_lock:
         if comic_id in _active_comic_processing:
@@ -99,99 +106,91 @@ def run_background_comic_analysis(
             return
         _active_comic_processing.add(comic_id)
 
-    logger.info("[BACKGROUND] Starting AI visual analysis pipeline for comic %s (%d pages)...", comic_id, len(pages))
     t0 = time.perf_counter()
+    logger.info("[BACKGROUND] Starting concurrent comic pipeline for comic %s (%d pages)...", comic_id, len(pages))
 
     try:
-        current_pages = [dict(p) for p in (initial_pages or pages)]
+        raw_pages = initial_pages or pages
+        current_pages = [dict(p) for p in raw_pages]
+        state_lock = threading.Lock()
+
+        # Filter pages that genuinely need AI analysis (skip already successfully analyzed pages)
+        pages_to_analyze = []
+        for p in pages:
+            p_status = p.get("status")
+            p_analysis = p.get("analysis")
+            has_summary = bool(p_analysis and p_analysis.get("page_summary"))
+            has_text = bool(p_analysis and isinstance(p_analysis.get("text"), dict) and p_analysis["text"].get("full_text"))
+            if p_status == "success" and (has_summary or has_text):
+                logger.info("[BACKGROUND] Page %s already has valid AI analysis. Skipping duplicate AI call.", p.get("page_number"))
+            else:
+                pages_to_analyze.append(p)
+
+        logger.info(
+            "[BACKGROUND] Pipeline dispatch: comic=%s total=%d pages, to_analyze=%d pages",
+            comic_id,
+            len(pages),
+            len(pages_to_analyze)
+        )
 
         def handle_page_analyzed(page_result: dict, completed_count: int, total_count: int):
             page_num = int(page_result.get("page_number", 1))
             logger.info("[PAGE PIPELINE] START page=%d", page_num)
 
-            try:
-                # 1. AI Analysis Status
-                if page_result.get("status") == "success":
-                    logger.info("[PAGE PIPELINE] AI ANALYSIS SUCCESS page=%d", page_num)
-                else:
-                    logger.warning("[PAGE PIPELINE] AI ANALYSIS FAILED page=%d error=%s", page_num, page_result.get("error", "Unknown"))
+            with state_lock:
+                try:
+                    # Retain any storage paths and signed CDN URLs if already populated by upload task
+                    for p in current_pages:
+                        if int(p.get("page_number", 1)) == page_num:
+                            if p.get("image_storage_path") and not page_result.get("image_storage_path"):
+                                page_result["image_storage_path"] = p.get("image_storage_path")
+                            if p.get("thumbnail_storage_path") and not page_result.get("thumbnail_storage_path"):
+                                page_result["thumbnail_storage_path"] = p.get("thumbnail_storage_path")
+                            if p.get("image_url") and not page_result.get("image_url"):
+                                page_result["image_url"] = p.get("image_url")
+                            if p.get("thumbnail_url") and not page_result.get("thumbnail_url"):
+                                page_result["thumbnail_url"] = p.get("thumbnail_url")
+                            break
 
-                # 2. Thumbnail Generation
-                logger.info("[PAGE PIPELINE] THUMBNAIL START page=%d", page_num)
-                local_img_path = Path(page_result.get("image_path") or f"storage/comics/{comic_id}/pages/page_{page_num:03d}.jpg")
-                thumb_path = ensure_page_thumbnail(comic_id, page_num, local_img_path)
-                if thumb_path and thumb_path.exists():
-                    logger.info("[PAGE PIPELINE] THUMBNAIL SUCCESS page=%d", page_num)
-                else:
-                    logger.warning("[PAGE PIPELINE] THUMBNAIL FAILED page=%d (thumbnail missing)", page_num)
+                    if page_result.get("status") == "success":
+                        logger.info("[PAGE PIPELINE] AI ANALYSIS SUCCESS page=%d", page_num)
+                    else:
+                        logger.warning("[PAGE PIPELINE] AI ANALYSIS FAILED page=%d error=%s", page_num, page_result.get("error", "Unknown"))
 
-                # 3. Image Upload to Supabase Storage
-                img_storage_path = None
-                thumb_storage_path = None
-                if is_supabase_storage_enabled() and user_id:
-                    if local_img_path.exists() and local_img_path.is_file():
-                        logger.info("[PAGE PIPELINE] IMAGE UPLOAD START page=%d", page_num)
-                        img_storage_path = upload_file_to_storage(
-                            storage_path=f"user/{user_id}/comics/{comic_id}/pages/{local_img_path.name}",
-                            local_file_path=local_img_path
-                        )
-                        if img_storage_path:
-                            logger.info("[PAGE PIPELINE] IMAGE UPLOAD SUCCESS page=%d", page_num)
-                        else:
-                            logger.error("[PAGE PIPELINE] IMAGE UPLOAD FAILED page=%d", page_num)
+                    # Update page in current_pages state
+                    for idx, p in enumerate(current_pages):
+                        if int(p.get("page_number", 1)) == page_num:
+                            current_pages[idx] = page_result
+                            break
 
-                    # 4. Thumbnail Upload to Supabase Storage
-                    if thumb_path and thumb_path.exists() and thumb_path.is_file():
-                        logger.info("[PAGE PIPELINE] THUMBNAIL UPLOAD START page=%d", page_num)
-                        thumb_storage_path = upload_file_to_storage(
-                            storage_path=f"user/{user_id}/comics/{comic_id}/thumbnails/thumb_p{page_num:03d}.jpg",
-                            local_file_path=thumb_path,
-                            content_type="image/jpeg"
-                        )
-                        if thumb_storage_path:
-                            logger.info("[PAGE PIPELINE] THUMBNAIL UPLOAD SUCCESS page=%d", page_num)
-                        else:
-                            logger.error("[PAGE PIPELINE] THUMBNAIL UPLOAD FAILED page=%d", page_num)
+                    # Save updated page analysis to database & json
+                    save_comic_json(
+                        comic_id=comic_id,
+                        comic_name=comic_name,
+                        source_format=source_format,
+                        pages=current_pages,
+                        status="processing",
+                        total_pages=len(pages),
+                        user_id=user_id
+                    )
+                    logger.info("[PAGE PIPELINE] DB SAVE SUCCESS page=%d", page_num)
 
-                # Attach verified paths to page result
-                if img_storage_path:
-                    page_result["image_storage_path"] = img_storage_path
-                if thumb_storage_path:
-                    page_result["thumbnail_storage_path"] = thumb_storage_path
+                except Exception as page_err:
+                    logger.exception("[PAGE PIPELINE] FAILED page=%d error=%s", page_num, str(page_err))
+                    page_result["status"] = "error"
+                    page_result["error"] = str(page_err)
+                    for idx, p in enumerate(current_pages):
+                        if int(p.get("page_number", 1)) == page_num:
+                            current_pages[idx] = page_result
+                            break
 
-                # Update page in current_pages state
-                for idx, p in enumerate(current_pages):
-                    if int(p.get("page_number", 1)) == page_num:
-                        current_pages[idx] = page_result
-                        break
-
-                # 5. Database Save
-                save_comic_json(
-                    comic_id=comic_id,
-                    comic_name=comic_name,
-                    source_format=source_format,
-                    pages=current_pages,
-                    status="processing",
-                    total_pages=len(pages),
-                    user_id=user_id
-                )
-                logger.info("[PAGE PIPELINE] DB SAVE SUCCESS page=%d", page_num)
-
-            except Exception as page_err:
-                logger.exception("[PAGE PIPELINE] FAILED page=%d error=%s exception_type=%s", page_num, str(page_err), type(page_err).__name__)
-                page_result["status"] = "error"
-                page_result["error"] = str(page_err)
-                for idx, p in enumerate(current_pages):
-                    if int(p.get("page_number", 1)) == page_num:
-                        current_pages[idx] = page_result
-                        break
-
-            # 6. Mark Page Processed & Complete
-            processed_count = sum(1 for p in current_pages if p.get("status") in ("success", "error"))
+            # Mark Progress
+            with state_lock:
+                processed_count = sum(1 for p in current_pages if p.get("status") in ("success", "error"))
             progress_pct = (processed_count / max(1, len(pages))) * 100
             logger.info("[PAGE PIPELINE] COMPLETE page=%d (%d/%d processed, progress=%.1f%%)", page_num, processed_count, len(pages), progress_pct)
 
-            # 7. Non-blocking RAG Ingestion (MUST NOT block page completion)
+            # Non-blocking per-page ChromaDB / pgvector Ingestion
             if page_result.get("status") == "success":
                 try:
                     ingest_page_to_rag(
@@ -204,15 +203,108 @@ def run_background_comic_analysis(
                 except Exception as ing_err:
                     logger.warning("[PAGE PIPELINE] RAG INGESTION FAILED page=%d error=%s (non-fatal)", page_num, str(ing_err))
 
-        # Run AI visual page analysis with worker concurrency
-        analyzed_pages = analyze_pages(
-            pages,
-            max_workers=MAX_AI_WORKERS,
-            max_retries=MAX_AI_RETRIES,
-            on_page_complete=handle_page_analyzed
-        )
+        # -------------------------------------------------------------
+        # STEP 1 & 2: Concurrently execute Cloudinary Upload & EdenAI Analysis
+        # -------------------------------------------------------------
+        logger.info("[BACKGROUND] Step 1: Launching concurrent Cloudinary asset upload and EdenAI analysis for comic %s...", comic_id)
 
-        # 8. Final Reconciliation Step
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            # Future 1: Cloudinary storage upload (images, thumbnails, direct CDN URLs)
+            upload_future = executor.submit(
+                upload_comic_assets_immediately,
+                comic_id=comic_id,
+                user_id=user_id,
+                pages=raw_pages,
+                original_file_path=original_file_path,
+                max_workers=8
+            )
+
+            # Future 2: EdenAI visual analysis (starts at t=0 on local image files)
+            analysis_future = None
+            if pages_to_analyze:
+                analysis_future = executor.submit(
+                    analyze_pages,
+                    pages=pages_to_analyze,
+                    max_workers=MAX_AI_WORKERS,
+                    max_retries=MAX_AI_RETRIES,
+                    on_page_complete=handle_page_analyzed
+                )
+
+            # Hook: When upload finishes, update current_pages with Cloudinary CDN URLs
+            def on_upload_completed(f):
+                try:
+                    enriched = f.result()
+                    with state_lock:
+                        for ep in enriched:
+                            pnum = int(ep.get("page_number", 1))
+                            for idx, cp in enumerate(current_pages):
+                                if int(cp.get("page_number", 1)) == pnum:
+                                    if ep.get("image_url"):
+                                        cp["image_url"] = ep["image_url"]
+                                    if ep.get("thumbnail_url"):
+                                        cp["thumbnail_url"] = ep["thumbnail_url"]
+                                    if ep.get("image_storage_path"):
+                                        cp["image_storage_path"] = ep["image_storage_path"]
+                                    if ep.get("thumbnail_storage_path"):
+                                        cp["thumbnail_storage_path"] = ep["thumbnail_storage_path"]
+                                    break
+                        save_comic_json(
+                            comic_id=comic_id,
+                            comic_name=comic_name,
+                            source_format=source_format,
+                            pages=current_pages,
+                            status="processing",
+                            total_pages=len(pages),
+                            user_id=user_id
+                        )
+                    logger.info("[BACKGROUND] Cloudinary asset upload complete & synced to DB for comic %s", comic_id)
+                except Exception as up_err:
+                    logger.warning("[BACKGROUND] Cloudinary asset upload error for comic %s: %s (non-fatal)", comic_id, str(up_err))
+
+            upload_future.add_done_callback(on_upload_completed)
+
+            # Await completion of AI analysis
+            if analysis_future:
+                analyzed_pages = analysis_future.result()
+                with state_lock:
+                    for res in analyzed_pages:
+                        pnum = int(res.get("page_number", 1))
+                        for idx, p in enumerate(current_pages):
+                            if int(p.get("page_number", 1)) == pnum:
+                                merged = dict(p)
+                                merged.update(res)
+                                if p.get("image_url"):
+                                    merged["image_url"] = p.get("image_url")
+                                if p.get("thumbnail_url"):
+                                    merged["thumbnail_url"] = p.get("thumbnail_url")
+                                if p.get("image_storage_path"):
+                                    merged["image_storage_path"] = p.get("image_storage_path")
+                                if p.get("thumbnail_storage_path"):
+                                    merged["thumbnail_storage_path"] = p.get("thumbnail_storage_path")
+                                current_pages[idx] = merged
+                                break
+
+            # Ensure Supabase upload has completed as well
+            try:
+                upload_future.result()
+            except Exception as up_exc:
+                logger.warning("[BACKGROUND] Supabase upload future returned error for comic %s: %s (non-fatal)", comic_id, str(up_exc))
+
+        # -------------------------------------------------------------
+        # STEP 3: Full Comic Chunking & ChromaDB / pgvector Ingestion
+        # -------------------------------------------------------------
+        json_file_path = COMICS_DIR / comic_id / "comic.json"
+        if json_file_path.exists():
+            try:
+                logger.info("[BACKGROUND] Step 3: Chunking and ingesting full comic into ChromaDB for comic %s...", comic_id)
+                ingest_comic_to_rag(str(json_file_path))
+            except Exception as rag_err:
+                logger.warning("[BACKGROUND] Full comic RAG ingestion error for %s: %s (non-fatal)", comic_id, str(rag_err))
+
+        # -------------------------------------------------------------
+        # STEP 4: Finally, update database status to 'completed'
+        # -------------------------------------------------------------
+        logger.info("[BACKGROUND] Step 4: Updating database status to 'completed' for comic %s...", comic_id)
         db = SessionLocal()
         try:
             db_pages = db.query(ComicPage).filter(ComicPage.comic_id == comic_id).all()
@@ -223,7 +315,6 @@ def run_background_comic_analysis(
 
             final_status = "failed" if (succ_count == 0 and fail_count > 0) else "completed"
 
-            # Update comic status in DB
             comic_row = db.query(Comic).filter(Comic.id == comic_id).first()
             if comic_row:
                 comic_row.status = final_status
@@ -232,24 +323,24 @@ def run_background_comic_analysis(
                 comic_row.failed_pages = fail_count
                 db.commit()
 
-            # Final comic.json save
             save_comic_json(
                 comic_id=comic_id,
                 comic_name=comic_name,
                 source_format=source_format,
-                pages=analyzed_pages,
+                pages=current_pages,
                 status=final_status,
                 total_pages=tot_count,
                 user_id=user_id
             )
 
             logger.info(
-                "[COMIC PIPELINE] FINISHED comic=%s total=%d successful=%d failed=%d processed=%d progress=100%%",
+                "[COMIC PIPELINE] FINISHED comic=%s total=%d successful=%d failed=%d processed=%d status=%s",
                 comic_id,
                 tot_count,
                 succ_count,
                 fail_count,
-                proc_count
+                proc_count,
+                final_status
             )
         except Exception as rec_err:
             logger.exception("[COMIC PIPELINE] Final reconciliation error for %s: %s", comic_id, str(rec_err))
@@ -435,10 +526,13 @@ async def upload_comic(
     # Phase C: Page extraction (fast, ~0.5 - 2s) with dual-resolution thumbnail creation
     try:
         if extension == ".cbr":
+            print("cbr Extracted")
             pages = extract_cbr(str(file_path), comic_id)
         elif extension == ".cbz":
+            print("cbz Extracted")
             pages = extract_cbz(str(file_path), comic_id)
         elif extension == ".pdf":
+            print("pdf Extracted")
             pages = extract_pdf(str(file_path), comic_id)
         elif extension in ALLOWED_EXTENSIONS:
             pages = extract_image(str(file_path), comic_id)
@@ -449,10 +543,18 @@ async def upload_comic(
             )
     except HTTPException:
         raise
-    except Exception:
+    except Exception as e:
+        logger.error(
+            "[UPLOAD] Comic extraction failed for comic_id=%s file=%s (%s): %s",
+            comic_id,
+            file.filename,
+            extension,
+            e,
+            exc_info=True
+        )
         raise HTTPException(
             status_code=500,
-            detail="Comic extraction failed. The file may be corrupted or invalid."
+            detail=f"Comic extraction failed: {str(e)}"
         )
 
     # Phase D: Initial page placeholders with dual resolution paths
@@ -522,19 +624,15 @@ async def upload_comic(
         user_id=current_user.id
     )
 
-    # Immediately sync extracted page images, thumbnails, and original file to Supabase Storage in parallel
+    # Phase E: Dispatch reordered background pipeline in detached daemon thread
+    # Step 1: Immediately upload images and thumbnails to Supabase Storage
+    # Step 2: Save initial page records to DB with image_url and thumbnail_url populated, status='processing'
+    # Step 3: Run EdenAI analysis, chunking, and ChromaDB ingestion
+    # Step 4: Update database status to 'completed'
     import threading
-    if current_user and current_user.id:
-        threading.Thread(
-            target=sync_comic_assets_to_supabase,
-            args=(comic_id, current_user.id, pages, file_path),
-            daemon=True
-        ).start()
-
-    # Phase E: Dispatch background analysis in detached daemon thread
     thread = threading.Thread(
         target=run_background_comic_analysis,
-        args=(comic_id, pages, comic_name, extension.replace(".", ""), initial_pages, current_user.id),
+        args=(comic_id, pages, comic_name, extension.replace(".", ""), initial_pages, current_user.id, file_path),
         daemon=True
     )
     thread.start()
@@ -580,57 +678,176 @@ async def get_comic_status(
     valid_id = validate_comic_id(comic_id)
     check_comic_access(valid_id, current_user.id, db=db)
 
-    comic_data = get_comic_data(valid_id, db=db)
-    if not comic_data:
+    # Expire cached session objects so background thread updates to ComicPage are immediately visible
+    db.expire_all()
+
+    comic_obj = db.query(Comic).filter(Comic.id == valid_id).first()
+    if not comic_obj:
         raise HTTPException(
             status_code=404,
             detail="Comic not found"
         )
 
-    meta = comic_data.get("comic", {})
-    pages = comic_data.get("pages", [])
-    status = meta.get("status", "completed")
-    successful = sum(1 for p in pages if p.get("status") == "success")
-    failed = sum(1 for p in pages if p.get("status") == "error")
+    db_pages = list(comic_obj.pages)
+    db_pages.sort(key=lambda p: p.page_number)
+    successful = sum(1 for p in db_pages if p.status == "success")
+    failed = sum(1 for p in db_pages if p.status == "error")
     analyzed = successful + failed
-    total = meta.get("total_pages", len(pages))
+    total = comic_obj.total_pages or len(db_pages)
+    status = comic_obj.status or "completed"
+
+    owner_id = current_user.id
+    paths_to_sign = []
+    for p in db_pages:
+        img_spath = p.image_storage_path or f"user/{owner_id}/comics/{valid_id}/pages/{p.filename or f'page_{p.page_number:03d}.jpg'}"
+        thumb_spath = p.thumbnail_storage_path or f"user/{owner_id}/comics/{valid_id}/thumbnails/thumb_p{p.page_number:03d}.jpg"
+        if (not p.thumbnail_url or p.thumbnail_url.startswith("/api/")) and thumb_spath:
+            paths_to_sign.append(thumb_spath)
+        if (not p.image_url or p.image_url.startswith("/api/")) and img_spath:
+            paths_to_sign.append(img_spath)
+
+    signed_urls_map = {}
+    if is_supabase_storage_enabled() and paths_to_sign:
+        try:
+            signed_urls_map = get_signed_storage_urls(paths_to_sign, expires_in=3600)
+        except Exception:
+            pass
+
+    # If any page is missing analysis_json in DB, check local comic.json as fallback
+    fallback_pages_map = {}
+    if any(p.status == "success" and not p.analysis_json for p in db_pages):
+        try:
+            local_json_file = COMICS_DIR / valid_id / "comic.json"
+            if local_json_file.exists():
+                with open(local_json_file, "r", encoding="utf-8") as f:
+                    cdata = json.load(f)
+                    for lpage in cdata.get("pages", []):
+                        lp_num = lpage.get("page_number")
+                        if lp_num and lpage.get("analysis"):
+                            fallback_pages_map[lp_num] = lpage.get("analysis")
+        except Exception:
+            pass
+
+    pages_list = []
+    for p in db_pages:
+        img_spath = p.image_storage_path or f"user/{owner_id}/comics/{valid_id}/pages/{p.filename or f'page_{p.page_number:03d}.jpg'}"
+        thumb_spath = p.thumbnail_storage_path or f"user/{owner_id}/comics/{valid_id}/thumbnails/thumb_p{p.page_number:03d}.jpg"
+
+        signed_thumb = signed_urls_map.get(thumb_spath) if signed_urls_map else None
+        signed_img = signed_urls_map.get(img_spath) if signed_urls_map else None
+
+        direct_thumb = p.thumbnail_url if (p.thumbnail_url and not p.thumbnail_url.startswith("/api/")) else None
+        direct_img = p.image_url if (p.image_url and not p.image_url.startswith("/api/")) else None
+
+        final_thumb = (
+            direct_thumb
+            or signed_thumb
+            or direct_img
+            or signed_img
+            or p.thumbnail_url
+            or f"/api/comics/{valid_id}/pages/{p.page_number}/thumbnail"
+        )
+        final_img = (
+            direct_img
+            or signed_img
+            or p.image_url
+            or f"/api/comics/{valid_id}/pages/{p.page_number}/image"
+        )
+
+        analysis = None
+        if p.analysis_json:
+            try:
+                analysis = json.loads(p.analysis_json)
+            except Exception:
+                pass
+        if analysis is None and p.page_number in fallback_pages_map:
+            analysis = fallback_pages_map[p.page_number]
+
+        pages_list.append({
+            "page_number": p.page_number,
+            "status": p.status,
+            "thumbnail_url": final_thumb,
+            "image_url": final_img,
+            "analysis": analysis,
+        })
+
+    logger.info(
+        "[STATUS] comic=%s status=%s pages_count=%d sample_thumb=%s",
+        valid_id,
+        status,
+        len(pages_list),
+        pages_list[0]["thumbnail_url"] if pages_list else None
+    )
 
     return {
         "comic_id": valid_id,
-        "title": meta.get("name", "Untitled Comic"),
+        "title": comic_obj.title or "Untitled Comic",
         "status": status,
         "total_pages": total,
         "analyzed_pages": analyzed if status != "completed" else total,
-        "successful_pages": successful if status != "completed" else meta.get("successful_pages", successful),
-        "failed_pages": failed if status != "completed" else meta.get("failed_pages", failed),
-        "rag_ingested": status == "completed"
+        "successful_pages": successful if status != "completed" else (comic_obj.successful_pages or successful),
+        "failed_pages": failed if status != "completed" else (comic_obj.failed_pages or failed),
+        "rag_ingested": status == "completed",
+        "pages": pages_list,
     }
 
 
 # ============================================================
-# Ask Question Endpoints
+# Chat & Ask Question Endpoints (Unblocked Real-Time RAG)
 # ============================================================
+
+@router.post("/{comic_id}/chat", response_model=QuestionResponse, summary="Chat with comic in real-time during or after processing")
+async def chat_with_comic(
+    comic_id: str,
+    request: QuestionRequest,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Asynchronous chat endpoint for querying a comic in real-time.
+    Unblocked during processing: searches whatever pages have been analyzed
+    and ingested into ChromaDB so far without blocking the event loop.
+    """
+    valid_id = validate_comic_id(comic_id)
+    check_comic_access(valid_id, current_user.id, db=db)
+
+    result = await asyncio.to_thread(
+        answer_question,
+        question=request.question,
+        comic_id=valid_id,
+        current_page=getattr(request, "current_page", None)
+    )
+    return result
+
 
 @router.post("/{comic_id}/ask", response_model=QuestionResponse, summary="Ask question about a specific comic")
 async def ask_comic_question(
     comic_id: str,
     request: QuestionRequest,
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
 ):
     """
-    Answers a question grounded strictly in the context of the specified comic owned by user.
+    Answers a question grounded in the context of the specified comic owned by user.
+    Unblocked during processing: queries whatever pages are currently available.
     """
-    return _handle_ask_question(
+    valid_id = validate_comic_id(comic_id)
+    check_comic_access(valid_id, current_user.id, db=db)
+
+    result = await asyncio.to_thread(
+        answer_question,
         question=request.question,
-        comic_id=comic_id,
-        user_id=current_user.id
+        comic_id=valid_id,
+        current_page=getattr(request, "current_page", None)
     )
+    return result
 
 
 @router.post("/ask", response_model=QuestionResponse, summary="Ask question with comic_id in request body")
 async def ask_question_generic(
     request: QuestionRequest,
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
 ):
     """
     Answers a question where comic_id is specified in the request body.
@@ -640,11 +857,16 @@ async def ask_question_generic(
             status_code=400,
             detail="comic_id is required"
         )
-    return _handle_ask_question(
+    valid_id = validate_comic_id(request.comic_id)
+    check_comic_access(valid_id, current_user.id, db=db)
+
+    result = await asyncio.to_thread(
+        answer_question,
         question=request.question,
-        comic_id=request.comic_id,
-        user_id=current_user.id
+        comic_id=valid_id,
+        current_page=getattr(request, "current_page", None)
     )
+    return result
 
 
 # ============================================================
@@ -663,6 +885,9 @@ async def get_comic_details(
     """
     valid_id = validate_comic_id(comic_id)
     check_comic_access(valid_id, current_user.id, db=db)
+
+    # Expire cached session objects so background thread updates to ComicPage are immediately visible
+    db.expire_all()
 
     comic_data = get_comic_data(valid_id, db=db)
     if not comic_data:
@@ -698,13 +923,14 @@ async def get_comic_details(
 
     # 3. Attach signed URLs to page metadata
     for p, img_spath, thumb_spath in page_path_map:
+        pnum = int(p.get("page_number", 1))
         thumb_url = signed_urls_map.get(thumb_spath) if signed_urls_map else None
         img_url = signed_urls_map.get(img_spath) if signed_urls_map else None
 
         if not thumb_url:
-            logger.info("[IMAGE DELIVERY] Missing storage object for thumbnail: %s", thumb_spath)
+            thumb_url = p.get("thumbnail_url") or f"/api/comics/{valid_id}/pages/{pnum}/thumbnail"
         if not img_url:
-            logger.info("[IMAGE DELIVERY] Missing storage object for image: %s", img_spath)
+            img_url = p.get("image_url") or f"/api/comics/{valid_id}/pages/{pnum}/image"
 
         p["thumbnail_url"] = thumb_url
         p["image_url"] = img_url

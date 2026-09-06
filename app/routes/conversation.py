@@ -3,6 +3,7 @@ Conversation Routes
 
 API endpoints for conversation lifecycle management and context-aware chat.
 """
+import asyncio
 import json
 import re
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import DEFAULT_TOP_K, MAX_CONVERSATION_MESSAGES
 from app.core.database import get_db
+from app.models.comic import Comic
 from app.models.user import User
 from app.routes.comic import check_comic_access, validate_comic_id
 from app.schemas.conversation import (
@@ -28,9 +30,15 @@ from app.services.conversation import (
     get_conversation,
     get_conversations_by_comic_id,
     get_messages,
+    get_sliding_window_history,
     validate_conversation_id,
 )
-from app.services.llm import clean_llm_response, stream_generate_answer_async
+from app.services.llm import (
+    clean_llm_response,
+    reformulate_query,
+    reformulate_query_async,
+    stream_generate_answer_async,
+)
 from app.services.query_normalizer import normalize_query
 from app.services.rag_preprocessor import build_page_content
 from app.services.rag_qa import (
@@ -195,19 +203,31 @@ async def ask_in_conversation(
         }
 
     try:
-        history = get_messages(
+        # 1. Fetch Comic-Specific Sliding Window History (limit=5)
+        history_messages, history_str = get_sliding_window_history(
             conversation_id=conversation["conversation_id"],
-            limit=MAX_CONVERSATION_MESSAGES,
+            comic_id=comic_id,
+            limit=5,
             db=db
         )
 
-        qa_result = answer_question(
-            question=request.question,
-            comic_id=comic_id,
-            conversation_history=history,
-            current_page=request.current_page
+        # 2. Conditional Query Reformulation (The Smart Step)
+        standalone_query = reformulate_query(
+            query=request.question,
+            chat_history=history_str
         )
 
+        # 3. Vector Search with Standalone Query & 4. Final Generation
+        qa_result = await asyncio.to_thread(
+            answer_question,
+            question=request.question,
+            comic_id=comic_id,
+            conversation_history=history_messages,
+            current_page=request.current_page,
+            standalone_query=standalone_query
+        )
+
+        # Save new User/Assistant interaction to database
         append_message(
             conversation_id=conversation["conversation_id"],
             role="user",
@@ -270,46 +290,34 @@ async def stream_in_conversation(
             return
 
         # -----------------------------
-        # 0. Active Page Processing Check
+        # 0. Active Page Information (Non-blocking)
         # -----------------------------
         page_obj = None
         if request.current_page is not None:
-            page_status, page_obj = get_page_info(comic_id, request.current_page)
-            if page_status == "processing":
-                msg = "This page is currently being analyzed. Please wait a moment..."
-                yield f"event: token\ndata: {json.dumps({'token': msg})}\n\n"
-                yield f"event: done\ndata: {json.dumps({'conversation_id': conversation_id, 'answer': msg, 'sources': []})}\n\n"
-                append_message(conversation["conversation_id"], role="user", content=request.question)
-                append_message(conversation["conversation_id"], role="assistant", content=msg)
-                return
-            elif page_status == "error":
-                msg = "This page could not be analyzed due to an error."
-                yield f"event: token\ndata: {json.dumps({'token': msg})}\n\n"
-                yield f"event: done\ndata: {json.dumps({'conversation_id': conversation_id, 'answer': msg, 'sources': []})}\n\n"
-                append_message(conversation["conversation_id"], role="user", content=request.question)
-                append_message(conversation["conversation_id"], role="assistant", content=msg)
-                return
+            try:
+                _, page_obj = get_page_info(comic_id, request.current_page)
+            except Exception:
+                page_obj = None
 
-        history = get_messages(
+        # 1. Fetch Comic-Specific Sliding Window History (limit=5)
+        history_messages, history_str = get_sliding_window_history(
             conversation_id=conversation["conversation_id"],
-            limit=MAX_CONVERSATION_MESSAGES
+            comic_id=comic_id,
+            limit=5,
+            db=db
         )
 
-        normalized_q = normalize_query(request.question)
-        retrieval_query = normalized_q
-        if history:
-            last_user_query = None
-            for msg in reversed(history):
-                if msg.get("role") == "user" and msg.get("content", "").strip():
-                    last_user_query = normalize_query(msg["content"])
-                    break
-            if last_user_query:
-                words = set(re.findall(r"\w+", normalized_q.lower()))
-                if words.intersection(FOLLOW_UP_INDICATORS) or len(words) <= 4:
-                    retrieval_query = f"{last_user_query} {normalized_q}"
+        # 2. Conditional Query Reformulation (The Smart Step)
+        standalone_query = await reformulate_query_async(
+            query=request.question,
+            chat_history=history_str
+        )
 
-        is_page_scoped = is_page_scoped_query(request.question, request.current_page)
-        page_chunks = get_chunks_by_page(comic_id, request.current_page) if request.current_page else []
+        normalized_standalone = normalize_query(standalone_query)
+        retrieval_query = normalized_standalone
+
+        is_page_scoped = is_page_scoped_query(standalone_query, request.current_page) or is_page_scoped_query(request.question, request.current_page)
+        page_chunks = await asyncio.to_thread(get_chunks_by_page, comic_id, request.current_page) if request.current_page else []
 
         # Fallback to direct comic.json page content if ChromaDB has not finished embedding page chunks
         if request.current_page and not page_chunks and page_obj and page_obj.get("status") == "success":
@@ -336,8 +344,10 @@ async def stream_in_conversation(
                     seen_ids.add(cid)
                     chunks.append(chunk)
             if not chunks:
-                semantic_chunks = retrieve_chunks(
-                    query=normalized_q,
+                # 3. Vector Search with the Standalone Query across all ingested pages
+                semantic_chunks = await asyncio.to_thread(
+                    retrieve_chunks,
+                    query=retrieval_query,
                     comic_id=comic_id,
                     top_k=DEFAULT_TOP_K
                 )
@@ -347,26 +357,22 @@ async def stream_in_conversation(
                         seen_ids.add(cid)
                         chunks.append(chunk)
         else:
-            is_story_query = is_comic_wide_story_query(request.question)
+            is_story_query = is_comic_wide_story_query(standalone_query) or is_comic_wide_story_query(request.question)
             if is_story_query:
-                overview_chunks = get_comic_overview_chunks(comic_id)
+                overview_chunks = await asyncio.to_thread(get_comic_overview_chunks, comic_id)
                 for chunk in overview_chunks:
                     cid = chunk.get("chunk_id")
                     if cid and cid not in seen_ids:
                         seen_ids.add(cid)
                         chunks.append(chunk)
 
-            semantic_chunks = retrieve_chunks(
+            # 3. Vector Search with the Standalone Query
+            semantic_chunks = await asyncio.to_thread(
+                retrieve_chunks,
                 query=retrieval_query,
                 comic_id=comic_id,
                 top_k=DEFAULT_TOP_K
             )
-            if not semantic_chunks and retrieval_query != normalized_q:
-                semantic_chunks = retrieve_chunks(
-                    query=normalized_q,
-                    comic_id=comic_id,
-                    top_k=DEFAULT_TOP_K
-                )
             for chunk in semantic_chunks:
                 cid = chunk.get("chunk_id")
                 if cid and cid not in seen_ids:
@@ -374,7 +380,7 @@ async def stream_in_conversation(
                     chunks.append(chunk)
 
             if not chunks:
-                overview_chunks = get_comic_overview_chunks(comic_id)
+                overview_chunks = await asyncio.to_thread(get_comic_overview_chunks, comic_id)
                 for chunk in overview_chunks:
                     cid = chunk.get("chunk_id")
                     if cid and cid not in seen_ids:
@@ -389,11 +395,23 @@ async def stream_in_conversation(
                         chunks.append(chunk)
 
         if not chunks:
-            fallback = "I could not find relevant information in the comic."
+            is_processing = False
+            try:
+                comic_rec = db.query(Comic).filter(Comic.id == comic_id).first()
+                if comic_rec and comic_rec.status == "processing":
+                    is_processing = True
+            except Exception:
+                pass
+
+            fallback = (
+                "This comic is currently being analyzed in real-time. No pages matching your question have finished transcription yet. Please try asking again shortly as pages complete!"
+                if is_processing
+                else "I could not find relevant information in the comic."
+            )
             yield f"event: token\ndata: {json.dumps({'token': fallback})}\n\n"
             yield f"event: done\ndata: {json.dumps({'conversation_id': conversation_id, 'answer': fallback, 'sources': []})}\n\n"
-            append_message(conversation["conversation_id"], role="user", content=request.question)
-            append_message(conversation["conversation_id"], role="assistant", content=fallback)
+            append_message(conversation["conversation_id"], role="user", content=request.question, db=db)
+            append_message(conversation["conversation_id"], role="assistant", content=fallback, db=db)
             return
 
         context_parts = []
@@ -417,23 +435,23 @@ async def stream_in_conversation(
         # Yield sources early so UI receives citation references
         yield f"event: sources\ndata: {json.dumps({'sources': sources})}\n\n"
 
-        # Stream generated tokens asynchronously in real time
+        # 4. Final Generation: Pass retrieved documents and standalone_query to main LLM
         full_tokens = []
         async for token in stream_generate_answer_async(
-            question=request.question,
+            question=standalone_query,
             context=context,
-            conversation_history=history,
+            conversation_history=history_messages,
             current_page=request.current_page
         ):
             full_tokens.append(token)
             yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
 
         full_answer = "".join(full_tokens).strip()
-        cleaned_answer = clean_llm_response(full_answer, question=request.question)
+        cleaned_answer = clean_llm_response(full_answer, question=standalone_query)
 
-        # Persist conversation turn in backend
-        append_message(conversation["conversation_id"], role="user", content=request.question)
-        append_message(conversation["conversation_id"], role="assistant", content=cleaned_answer)
+        # Save new User/Assistant interaction to database
+        append_message(conversation["conversation_id"], role="user", content=request.question, db=db)
+        append_message(conversation["conversation_id"], role="assistant", content=cleaned_answer, sources=sources, db=db)
 
         yield f"event: done\ndata: {json.dumps({'conversation_id': conversation_id, 'answer': cleaned_answer, 'sources': sources})}\n\n"
 

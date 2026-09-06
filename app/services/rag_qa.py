@@ -10,7 +10,7 @@ from pathlib import Path
 
 from app.core.config import COMICS_DIR, DEFAULT_TOP_K
 from app.core.logging import logger
-from app.services.llm import generate_answer
+from app.services.llm import generate_answer, reformulate_query
 from app.services.query_normalizer import normalize_query
 from app.services.rag_preprocessor import build_page_content
 from app.services.retriever import (
@@ -169,11 +169,12 @@ def answer_question(
     top_k: int = DEFAULT_TOP_K,
     distance_threshold: float | None = DEFAULT_DISTANCE_THRESHOLD,
     conversation_history: list[dict] | None = None,
-    current_page: int | None = None
+    current_page: int | None = None,
+    standalone_query: str | None = None
 ) -> dict:
     """
-    Answers a question grounded in the specified comic context, optionally utilizing
-    conversation history for reference resolution and current_page for page-scoped grounding.
+    Answers a question grounded in the specified comic context, utilizing
+    smart query reformulation for coreference resolution and current_page for page-scoped grounding.
     """
     if not comic_id or not comic_id.strip():
         raise ValueError(
@@ -183,55 +184,47 @@ def answer_question(
     comic_id = comic_id.strip()
 
     # -----------------------------
-    # 0. Active Page Processing Check
+    # 0. Active Page Information (Non-blocking)
     # -----------------------------
     page_obj = None
     if current_page is not None:
-        page_status, page_obj = get_page_info(comic_id, current_page)
-        if page_status == "processing":
-            logger.info("[RAG QA] Page %s is currently processing for comic %s. Returning wait message.", current_page, comic_id)
-            return {
-                "comic_id": comic_id,
-                "question": question,
-                "answer": PROCESSING_PAGE_ANSWER,
-                "sources": []
-            }
-        elif page_status == "error":
-            return {
-                "comic_id": comic_id,
-                "question": question,
-                "answer": "This page could not be analyzed due to an error.",
-                "sources": []
-            }
+        try:
+            _, page_obj = get_page_info(comic_id, current_page)
+        except Exception:
+            page_obj = None
 
     # -----------------------------
-    # 1. Normalize Query
+    # 1. Smart Query Reformulation (Coreference Resolution)
     # -----------------------------
     original_question = question
-    normalized_question = normalize_query(question)
+    if standalone_query is not None and standalone_query.strip():
+        effective_query = standalone_query.strip()
+    elif conversation_history:
+        lines = []
+        for msg in conversation_history[-5:]:
+            r = "User" if msg.get("role") == "user" else "Assistant"
+            c = msg.get("content", "").strip()
+            if c:
+                lines.append(f"{r}: {c}")
+        h_str = "\n".join(lines)
+        effective_query = reformulate_query(query=question, chat_history=h_str) if h_str else question
+    else:
+        effective_query = question
+
+    # -----------------------------
+    # 2. Normalize Query & Retrieval Query
+    # -----------------------------
+    normalized_question = normalize_query(effective_query)
     if not normalized_question:
         return {
             "comic_id": comic_id,
             "question": original_question,
+            "standalone_query": effective_query,
             "answer": "Please provide a valid question.",
             "sources": []
         }
 
-    # -----------------------------
-    # 2. Build Retrieval Query
-    # -----------------------------
     retrieval_query = normalized_question
-    if conversation_history:
-        last_user_query = None
-        for msg in reversed(conversation_history):
-            if msg.get("role") == "user" and msg.get("content", "").strip():
-                last_user_query = normalize_query(msg["content"])
-                break
-
-        if last_user_query:
-            words = set(re.findall(r"\w+", normalized_question.lower()))
-            if words.intersection(FOLLOW_UP_INDICATORS) or len(words) <= 4:
-                retrieval_query = f"{last_user_query} {normalized_question}"
 
     # -----------------------------
     # 3. Retrieve Chunks (Semantic + Page-Scoped)
@@ -279,7 +272,7 @@ def answer_question(
                     chunks.append(chunk)
     else:
         # If user is asking about the comic story / overall plot / summary, prioritize full comic overview
-        is_story_query = is_comic_wide_story_query(question)
+        is_story_query = is_comic_wide_story_query(effective_query) or is_comic_wide_story_query(original_question)
         if is_story_query:
             overview_chunks = get_comic_overview_chunks(comic_id)
             for chunk in overview_chunks:
@@ -288,20 +281,13 @@ def answer_question(
                     seen_ids.add(cid)
                     chunks.append(chunk)
 
-        # Retrieve semantic chunks across comic
+        # Retrieve semantic chunks across comic using standalone reformulated query
         semantic_chunks = retrieve_chunks(
             query=retrieval_query,
             comic_id=comic_id,
             top_k=top_k,
             distance_threshold=distance_threshold
         )
-        if not semantic_chunks and retrieval_query != normalized_question:
-            semantic_chunks = retrieve_chunks(
-                query=normalized_question,
-                comic_id=comic_id,
-                top_k=top_k,
-                distance_threshold=distance_threshold
-            )
         for chunk in semantic_chunks:
             cid = chunk.get("chunk_id")
             if cid and cid not in seen_ids:
@@ -323,16 +309,37 @@ def answer_question(
                 if cid and cid not in seen_ids:
                     seen_ids.add(cid)
                     chunks.append(chunk)
-        print(f"[RAG QA DEBUG] Global query '{question}' -> {len(chunks)} chunks retrieved")
+        print(f"[RAG QA DEBUG] Global query '{effective_query}' -> {len(chunks)} chunks retrieved")
 
     # -----------------------------
-    # 4. No Results Fallback
+    # 4. No Results Fallback (Real-Time Aware)
     # -----------------------------
     if not chunks:
+        is_processing = False
+        try:
+            from app.models.comic import Comic
+            from app.core.database import SessionLocal
+            _db = SessionLocal()
+            try:
+                c_row = _db.query(Comic).filter(Comic.id == comic_id).first()
+                if c_row and c_row.status == "processing":
+                    is_processing = True
+            finally:
+                _db.close()
+        except Exception:
+            pass
+
+        fallback_msg = (
+            "This comic is currently being analyzed in real-time. No pages matching your question have finished transcription yet. Please try asking again shortly as pages complete!"
+            if is_processing
+            else FALLBACK_ANSWER
+        )
+
         return {
             "comic_id": comic_id,
             "question": original_question,
-            "answer": FALLBACK_ANSWER,
+            "standalone_query": effective_query,
+            "answer": fallback_msg,
             "sources": []
         }
 
@@ -363,18 +370,18 @@ def answer_question(
     context = "\n\n--------------------\n\n".join(context_parts)
 
     # -----------------------------
-    # 6. Generate Answer with LLM
+    # 6. Generate Answer with LLM (Pass standalone_query)
     # -----------------------------
     if current_page is not None:
         raw_answer = generate_answer(
-            question=original_question,
+            question=effective_query,
             context=context,
             conversation_history=conversation_history,
             current_page=current_page
         )
     else:
         raw_answer = generate_answer(
-            question=original_question,
+            question=effective_query,
             context=context,
             conversation_history=conversation_history
         )
@@ -392,6 +399,7 @@ def answer_question(
     return {
         "comic_id": comic_id,
         "question": original_question,
+        "standalone_query": effective_query,
         "answer": answer,
         "sources": sources
     }

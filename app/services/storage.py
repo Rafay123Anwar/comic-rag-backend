@@ -8,13 +8,24 @@ and local disk caching for high-performance reading and AI indexing.
 import json
 import logging
 import shutil
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from app.core.config import COMICS_DIR, TEMP_DIR, UPLOADS_DIR
+import cloudinary
+import cloudinary.api
+import cloudinary.uploader
+from app.core.config import (
+    CLOUDINARY_API_KEY,
+    CLOUDINARY_API_SECRET,
+    CLOUDINARY_CLOUD_NAME,
+    COMICS_DIR,
+    TEMP_DIR,
+    UPLOADS_DIR,
+)
 from app.core.database import SessionLocal
 from app.core.supabase import (
     delete_storage_files,
@@ -28,6 +39,34 @@ from app.models.comic import Comic, ComicPage
 from app.services.rag_preprocessor import build_complete_text
 
 logger = logging.getLogger("comic_rag")
+
+_cloudinary_configured = False
+
+
+def ensure_cloudinary_configured() -> bool:
+    """Initializes Cloudinary SDK configuration if credentials are set."""
+    global _cloudinary_configured
+    if _cloudinary_configured:
+        return True
+    if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
+        try:
+            cloudinary.config(
+                cloud_name=CLOUDINARY_CLOUD_NAME,
+                api_key=CLOUDINARY_API_KEY,
+                api_secret=CLOUDINARY_API_SECRET,
+                secure=True,
+            )
+            _cloudinary_configured = True
+            return True
+        except Exception as e:
+            logger.warning("[CLOUDINARY] Failed to configure Cloudinary: %s", str(e))
+            return False
+    return False
+
+
+def is_cloudinary_enabled() -> bool:
+    """Returns True if Cloudinary SDK is successfully configured."""
+    return ensure_cloudinary_configured()
 
 
 def build_comic_full_text(pages: list) -> str:
@@ -182,6 +221,8 @@ def save_comic_to_db(
 
         img_storage = page_dict.get("image_storage_path") or page_dict.get("storage_path")
         thumb_storage = page_dict.get("thumbnail_storage_path")
+        img_url = page_dict.get("image_url")
+        thumb_url = page_dict.get("thumbnail_url")
 
         if pnum in existing_pages:
             db_page = existing_pages[pnum]
@@ -193,6 +234,10 @@ def save_comic_to_db(
                 db_page.image_storage_path = img_storage
             if thumb_storage:
                 db_page.thumbnail_storage_path = thumb_storage
+            if img_url:
+                db_page.image_url = img_url
+            if thumb_url:
+                db_page.thumbnail_url = thumb_url
         else:
             db_page = ComicPage(
                 comic_id=comic_id,
@@ -201,6 +246,8 @@ def save_comic_to_db(
                 status=pstatus,
                 image_storage_path=img_storage,
                 thumbnail_storage_path=thumb_storage,
+                image_url=img_url,
+                thumbnail_url=thumb_url,
                 analysis_json=analysis_str
             )
             db.add(db_page)
@@ -293,6 +340,157 @@ def save_comic_json(
     return data
 
 
+def upload_comic_assets_immediately(
+    comic_id: str,
+    user_id: str,
+    pages: list,
+    original_file_path: Optional[Path] = None,
+    max_workers: int = 8
+) -> list[dict]:
+    """
+    IMMEDIATELY uploads extracted comic page images, thumbnails, and original file
+    to Cloudinary concurrently using a ThreadPoolExecutor.
+    Saves Cloudinary secure_url directly to image_url and thumbnail_url,
+    eliminating local signed URL overhead and providing high-speed CDN delivery.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    comic_dir = Path(COMICS_DIR) / comic_id
+    pages_dir = comic_dir / "pages"
+    thumb_dir = comic_dir / "thumbnails"
+
+    # 1. Asynchronously upload original archive file in background to Cloudinary
+    if is_cloudinary_enabled() and original_file_path and original_file_path.exists():
+        def _upload_archive_in_background():
+            try:
+                cloudinary.uploader.upload(
+                    str(original_file_path),
+                    folder=f"comics/{comic_id}/original",
+                    public_id=original_file_path.stem,
+                    resource_type="raw",
+                    overwrite=True
+                )
+                logger.info("[CLOUDINARY] Background upload completed for original file of comic %s", comic_id)
+            except Exception as e:
+                logger.warning("[CLOUDINARY] Background archive upload error for comic %s: %s (non-fatal)", comic_id, str(e))
+
+        threading.Thread(
+            target=_upload_archive_in_background,
+            daemon=True,
+            name=f"archive-upload-{comic_id[:8]}"
+        ).start()
+
+    # 2. Concurrently upload page images and thumbnails to Cloudinary
+    page_tasks = []
+    enriched_pages = []
+
+    for page in pages:
+        p_copy = dict(page)
+        pnum = int(p_copy.get("page_number", 1))
+        fname = p_copy.get("filename", f"page_{pnum:03d}.jpg")
+
+        local_pfile = Path(p_copy.get("image_path") or (pages_dir / fname))
+        local_tfile = Path(p_copy.get("thumbnail_path") or (thumb_dir / f"thumb_p{pnum:03d}.jpg"))
+
+        enriched_pages.append(p_copy)
+
+        if is_cloudinary_enabled():
+            page_tasks.append({
+                "page_number": pnum,
+                "pfile": local_pfile if local_pfile.exists() and local_pfile.is_file() else None,
+                "tfile": local_tfile if local_tfile.exists() and local_tfile.is_file() else None,
+            })
+
+    uploaded_updates = {}
+
+    if is_cloudinary_enabled() and page_tasks:
+        def _do_page_upload(item):
+            pnum = item["page_number"]
+            pfile = item["pfile"]
+            tfile = item["tfile"]
+
+            img_url = None
+            thumb_url = None
+            img_pid = None
+            thumb_pid = None
+
+            if pfile and pfile.exists() and pfile.is_file():
+                try:
+                    res_img = cloudinary.uploader.upload(
+                        str(pfile),
+                        folder=f"comics/{comic_id}/pages",
+                        public_id=f"page_{pnum:03d}",
+                        resource_type="image",
+                        overwrite=True
+                    )
+                    img_url = res_img.get("secure_url")
+                    img_pid = res_img.get("public_id")
+                except Exception as e:
+                    logger.warning("[CLOUDINARY] Failed to upload page %d image for %s: %s", pnum, comic_id, str(e))
+
+            if tfile and tfile.exists() and tfile.is_file():
+                try:
+                    res_thumb = cloudinary.uploader.upload(
+                        str(tfile),
+                        folder=f"comics/{comic_id}/thumbnails",
+                        public_id=f"thumb_p{pnum:03d}",
+                        resource_type="image",
+                        overwrite=True
+                    )
+                    thumb_url = res_thumb.get("secure_url")
+                    thumb_pid = res_thumb.get("public_id")
+                except Exception as e:
+                    logger.warning("[CLOUDINARY] Failed to upload page %d thumb for %s: %s", pnum, comic_id, str(e))
+
+            return pnum, img_url, thumb_url, img_pid, thumb_pid
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = executor.map(_do_page_upload, page_tasks)
+            for pnum, img_url, thumb_url, img_pid, thumb_pid in results:
+                uploaded_updates[pnum] = (img_url, thumb_url, img_pid, thumb_pid)
+
+        # Attach Cloudinary direct secure_url to enriched_pages
+        for p in enriched_pages:
+            pnum = int(p.get("page_number", 1))
+            img_url, thumb_url, img_pid, thumb_pid = uploaded_updates.get(pnum, (None, None, None, None))
+            p["image_url"] = img_url or p.get("image_url") or f"/api/comics/{comic_id}/pages/{pnum}/image"
+            p["thumbnail_url"] = thumb_url or p.get("thumbnail_url") or f"/api/comics/{comic_id}/pages/{pnum}/thumbnail"
+            if img_pid:
+                p["image_storage_path"] = img_pid
+            if thumb_pid:
+                p["thumbnail_storage_path"] = thumb_pid
+    else:
+        for p in enriched_pages:
+            pnum = int(p.get("page_number", 1))
+            p["image_url"] = p.get("image_url") or f"/api/comics/{comic_id}/pages/{pnum}/image"
+            p["thumbnail_url"] = p.get("thumbnail_url") or f"/api/comics/{comic_id}/pages/{pnum}/thumbnail"
+
+    # 3. Persist verified paths and Cloudinary secure URLs to PostgreSQL
+    db = SessionLocal()
+    try:
+        db_pages = db.query(ComicPage).filter(ComicPage.comic_id == comic_id).all()
+        page_dict_by_num = {p.get("page_number"): p for p in enriched_pages}
+        for db_p in db_pages:
+            if db_p.page_number in page_dict_by_num:
+                enriched = page_dict_by_num[db_p.page_number]
+                if enriched.get("image_storage_path"):
+                    db_p.image_storage_path = enriched["image_storage_path"]
+                if enriched.get("thumbnail_storage_path"):
+                    db_p.thumbnail_storage_path = enriched["thumbnail_storage_path"]
+                if enriched.get("image_url"):
+                    db_p.image_url = enriched["image_url"]
+                if enriched.get("thumbnail_url"):
+                    db_p.thumbnail_url = enriched["thumbnail_url"]
+        db.commit()
+    except Exception as e:
+        logger.warning("[CLOUDINARY] Failed to persist uploaded paths/URLs to DB for comic %s: %s", comic_id, str(e))
+    finally:
+        db.close()
+
+    logger.info("[CLOUDINARY] Uploaded & mapped %d page assets to Cloudinary CDN for comic %s", len(enriched_pages), comic_id)
+    return enriched_pages
+
+
 def sync_comic_assets_to_supabase(
     comic_id: str,
     user_id: str,
@@ -300,103 +498,9 @@ def sync_comic_assets_to_supabase(
     original_file_path: Optional[Path] = None
 ) -> None:
     """
-    Uploads original file, extracted pages, thumbnails, and backup comic.json to Supabase Storage
-    and verifies/persists storage paths to PostgreSQL.
+    Backwards-compatible wrapper delegating to upload_comic_assets_immediately.
     """
-    if not is_supabase_storage_enabled() or not user_id:
-        return
-
-    from concurrent.futures import ThreadPoolExecutor
-    ensure_bucket_exists()
-
-    comic_dir = Path(COMICS_DIR) / comic_id
-    pages_dir = comic_dir / "pages"
-    thumb_dir = comic_dir / "thumbnails"
-    json_path = comic_dir / "comic.json"
-
-    # 1. Upload original file
-    if original_file_path and original_file_path.exists():
-        orig_storage = f"user/{user_id}/comics/{comic_id}/original/{original_file_path.name}"
-        upload_file_to_storage(
-            storage_path=orig_storage,
-            local_file_path=original_file_path,
-            content_type=None
-        )
-
-    # 2. Upload comic.json backup
-    if json_path.exists():
-        upload_file_to_storage(
-            storage_path=f"user/{user_id}/comics/{comic_id}/comic.json",
-            local_file_path=json_path,
-            content_type="application/json"
-        )
-
-    # 3. Upload extracted pages & thumbnails with verified path updates
-    page_tasks = []
-    for page in pages:
-        pnum = int(page.get("page_number", 1))
-        fname = page.get("filename", f"page_{pnum:03d}.jpg")
-        local_pfile = pages_dir / fname
-        local_tfile = thumb_dir / f"thumb_p{pnum:03d}.jpg"
-
-        p_item = {
-            "page_number": pnum,
-            "filename": fname,
-            "pfile": local_pfile if local_pfile.exists() and local_pfile.is_file() else None,
-            "tfile": local_tfile if local_tfile.exists() and local_tfile.is_file() else None,
-        }
-        page_tasks.append(p_item)
-
-    uploaded_updates = {}
-
-    def _do_page_upload(item):
-        pnum = item["page_number"]
-        fname = item["filename"]
-        pfile = item["pfile"]
-        tfile = item["tfile"]
-        img_uploaded = None
-        thumb_uploaded = None
-
-        if pfile:
-            img_uploaded = upload_file_to_storage(
-                storage_path=f"user/{user_id}/comics/{comic_id}/pages/{fname}",
-                local_file_path=pfile,
-                content_type=None
-            )
-        if tfile:
-            thumb_uploaded = upload_file_to_storage(
-                storage_path=f"user/{user_id}/comics/{comic_id}/thumbnails/thumb_p{pnum:03d}.jpg",
-                local_file_path=tfile,
-                content_type="image/jpeg"
-            )
-
-        return pnum, img_uploaded, thumb_uploaded
-
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        results = executor.map(_do_page_upload, page_tasks)
-        for pnum, img_path, thumb_path in results:
-            if img_path or thumb_path:
-                uploaded_updates[pnum] = (img_path, thumb_path)
-
-    # Update DB with verified paths
-    if uploaded_updates:
-        db = SessionLocal()
-        try:
-            db_pages = db.query(ComicPage).filter(ComicPage.comic_id == comic_id).all()
-            for db_p in db_pages:
-                if db_p.page_number in uploaded_updates:
-                    img_p, thumb_p = uploaded_updates[db_p.page_number]
-                    if img_p:
-                        db_p.image_storage_path = img_p
-                    if thumb_p:
-                        db_p.thumbnail_storage_path = thumb_p
-            db.commit()
-        except Exception as e:
-            logger.warning("[SUPABASE] Failed to persist uploaded paths to DB for comic %s: %s", comic_id, str(e))
-        finally:
-            db.close()
-
-    logger.info("[SUPABASE] Synced %d page assets to Supabase Storage for comic %s", len(uploaded_updates), comic_id)
+    upload_comic_assets_immediately(comic_id, user_id, pages, original_file_path)
 
 
 def backfill_missing_comic_storage_assets(comic_id: Optional[str] = None, user_id: Optional[str] = None) -> int:
@@ -475,6 +579,15 @@ def get_comic_data(comic_id: str, db: Optional[Session] = None) -> dict | None:
     try:
         comic = db.query(Comic).filter(Comic.id == comic_id).first()
         if comic:
+            fallback_pages_map = {}
+            if any(p.status == "success" and not p.analysis_json for p in comic.pages):
+                local_data = get_comic_json_data(comic_id)
+                if local_data and "pages" in local_data:
+                    for lp in local_data["pages"]:
+                        lp_num = lp.get("page_number")
+                        if lp_num and lp.get("analysis"):
+                            fallback_pages_map[lp_num] = lp.get("analysis")
+
             pages = []
             for p in comic.pages:
                 analysis = None
@@ -483,6 +596,8 @@ def get_comic_data(comic_id: str, db: Optional[Session] = None) -> dict | None:
                         analysis = json.loads(p.analysis_json)
                     except Exception:
                         pass
+                if analysis is None and p.page_number in fallback_pages_map:
+                    analysis = fallback_pages_map[p.page_number]
                 pages.append({
                     "page_number": p.page_number,
                     "filename": p.filename,
@@ -495,7 +610,9 @@ def get_comic_data(comic_id: str, db: Optional[Session] = None) -> dict | None:
                         "has_text": bool(analysis and analysis.get("text", {}).get("full_text"))
                     },
                     "image_storage_path": p.image_storage_path,
-                    "thumbnail_storage_path": p.thumbnail_storage_path
+                    "thumbnail_storage_path": p.thumbnail_storage_path,
+                    "image_url": p.image_url,
+                    "thumbnail_url": p.thumbnail_url
                 })
 
             return {
@@ -651,7 +768,15 @@ def delete_comic_storage(comic_id: str, user_id: Optional[str] = None, db: Optio
         if close_session:
             db.close()
 
-    # 2. Delete from Supabase Storage
+    # 2. Delete from Cloudinary and Supabase Storage
+    if is_cloudinary_enabled():
+        try:
+            cloudinary.api.delete_resources_by_prefix(f"comics/{cleaned_id}/")
+            cloudinary.api.delete_folder(f"comics/{cleaned_id}")
+            logger.info("[CLOUDINARY] Cleaned up Cloudinary assets for comic %s", cleaned_id)
+        except Exception as e:
+            logger.warning("[CLOUDINARY] Cloudinary deletion error for comic %s: %s (non-fatal)", cleaned_id, str(e))
+
     if is_supabase_storage_enabled() and user_id:
         try:
             storage_paths_to_delete = [

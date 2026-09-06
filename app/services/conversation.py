@@ -228,6 +228,78 @@ def get_messages(conversation_id: str, limit: Optional[int] = None, db: Optional
     return messages
 
 
+def get_sliding_window_history(
+    conversation_id: str,
+    comic_id: Optional[str] = None,
+    limit: int = 5,
+    db: Optional[Session] = None
+) -> tuple[list[dict], str]:
+    """
+    Queries the database for the last `limit` messages specific to the current
+    conversation_id and comic_id, and formats them into a simple string
+    (e.g., User: ... \\n Assistant: ...).
+    Returns a tuple of (raw_messages, formatted_history_string).
+    """
+    cleaned_id = validate_conversation_id(conversation_id)
+    cleaned_comic_id = comic_id.strip() if comic_id else None
+
+    close_session = False
+    if db is None:
+        db = SessionLocal()
+        close_session = True
+
+    raw_messages = []
+    try:
+        query = (
+            db.query(Message)
+            .join(Conversation, Message.conversation_id == Conversation.id)
+            .filter(Message.conversation_id == cleaned_id)
+        )
+        if cleaned_comic_id:
+            query = query.filter(Conversation.comic_id == cleaned_comic_id)
+
+        recent_msgs = query.order_by(Message.created_at.desc()).limit(limit).all()
+        for m in reversed(recent_msgs):
+            sources = None
+            if m.sources_json:
+                try:
+                    sources = json.loads(m.sources_json)
+                except Exception:
+                    pass
+            raw_messages.append({
+                "role": m.role,
+                "content": m.content,
+                "timestamp": m.created_at.isoformat() if m.created_at else "",
+                "sources": sources
+            })
+    except Exception as e:
+        logger.warning("[CONVERSATION] DB sliding window history error for %s: %s", cleaned_id, str(e))
+    finally:
+        if close_session:
+            db.close()
+
+    # Fallback to local JSON if DB returned no messages or error occurred
+    if not raw_messages:
+        try:
+            conv = get_conversation(cleaned_id, db=db)
+            if conv and (not cleaned_comic_id or conv.get("comic_id") == cleaned_comic_id):
+                all_msgs = conv.get("messages", [])
+                raw_messages = all_msgs[-limit:] if limit > 0 else all_msgs
+        except Exception:
+            pass
+
+    # Format into simple string: User: ... \n Assistant: ...
+    lines = []
+    for msg in raw_messages:
+        role_label = "User" if msg.get("role") == "user" else "Assistant"
+        content = msg.get("content", "").strip()
+        if content:
+            lines.append(f"{role_label}: {content}")
+    formatted_str = "\n".join(lines)
+
+    return raw_messages, formatted_str
+
+
 def delete_conversation(
     conversation_id: str,
     user_id: Optional[str] = None,

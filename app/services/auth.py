@@ -1,7 +1,7 @@
 """
 Authentication Services and Dependencies
 """
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -13,20 +13,25 @@ security_scheme = HTTPBearer(auto_error=False)
 
 
 async def get_current_user(
+    token_query: str | None = Query(None, alias="token"),
     credentials: HTTPAuthorizationCredentials | None = Depends(security_scheme),
     db: Session = Depends(get_db)
 ) -> User:
     """
-    Extracts Bearer token from Authorization header, validates JWT, and fetches the user from DB.
+    Extracts Bearer token from Authorization header or ?token= query parameter, validates JWT, and fetches the user from DB.
     """
-    if not credentials or not credentials.credentials:
+    token = None
+    if credentials and credentials.credentials:
+        token = credentials.credentials
+    elif token_query:
+        token = token_query
+
+    if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication credentials were not provided.",
             headers={"WWW-Authenticate": "Bearer"},
         )
-
-    token = credentials.credentials
     payload = decode_access_token(token)
     if payload is None:
         raise HTTPException(

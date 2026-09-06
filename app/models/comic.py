@@ -50,6 +50,8 @@ class ComicPage(Base):
     status = Column(String(50), nullable=False, default="processing")
     image_storage_path = Column(String(512), nullable=True)
     thumbnail_storage_path = Column(String(512), nullable=True)
+    image_url = Column(Text, nullable=True)
+    thumbnail_url = Column(Text, nullable=True)
     analysis_json = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=get_utc_now, nullable=False)
 

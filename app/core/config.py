@@ -10,7 +10,7 @@ load_dotenv()
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-large-2512")
-LLM_MODEL = os.getenv("LLM_MODEL", "mistral-large-2512")
+LLM_MODEL = os.getenv("LLM_MODEL", "mistral-small-latest")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "mistral-embed-2312")
 
 # -----------------------------
@@ -34,6 +34,13 @@ SUPABASE_STORAGE_BUCKET = os.getenv(
     "SUPABASE_STORAGE_BUCKET",
     "Comic-Rag"
 )
+
+# -----------------------------
+# Cloudinary Configuration
+# -----------------------------
+CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME", "j1irrluf")
+CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY", "824165943619962")
+CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET", "vjzAO4Bj2sOu8FtuD0-0eqwHSN8")
 
 raw_db_url = os.getenv("DATABASE_URL", f"sqlite:///{STORAGE_DIR / 'comic_rag.db'}")
 if raw_db_url.startswith("postgres://"):
@@ -74,7 +81,8 @@ ENABLE_HYBRID_OCR = os.getenv("ENABLE_HYBRID_OCR", "false").lower() in ("true", 
 # -----------------------------
 # Analysis & Extraction Config
 # -----------------------------
-MAX_AI_WORKERS = int(os.getenv("MAX_AI_WORKERS", "2"))
+MAX_AI_WORKERS = int(os.getenv("MAX_AI_WORKERS", "12"))
+print("MAX_AI_WORKERS", MAX_AI_WORKERS)
 MAX_AI_RETRIES = int(os.getenv("MAX_AI_RETRIES", "5"))
 SEVEN_ZIP_PATH = os.getenv(
     "SEVEN_ZIP_PATH",
@@ -90,8 +98,15 @@ ALLOWED_IMAGE_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".webp"
 }
 
-MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50"))
+MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "100"))
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+
+# -----------------------------
+# CORS Configuration
+# -----------------------------
+# Comma-separated frontend origins, or "*" to allow all origins
+# Example: CORS_ORIGINS=http://localhost:5173,http://13.218.185.215,https://yourcomicapp.com
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
 
 # -----------------------------
 # Validation

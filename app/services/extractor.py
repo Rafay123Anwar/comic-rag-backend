@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess as sp
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from PIL import Image
@@ -20,6 +21,56 @@ SEVEN_ZIP = SEVEN_ZIP_PATH
 # Maximum dimension and compression settings for instant low-resolution progressive preview
 THUMBNAIL_MAX_SIZE = (480, 720)
 THUMBNAIL_JPEG_QUALITY = 45
+
+
+def find_seven_zip() -> str | None:
+    """Finds the 7-Zip binary across config, PATH, and common installation locations."""
+    if SEVEN_ZIP and os.path.exists(SEVEN_ZIP):
+        return SEVEN_ZIP
+
+    for candidate in ("7z", "7za", "7z.exe"):
+        found = shutil.which(candidate)
+        if found:
+            return found
+
+    common_paths = [
+        r"C:\Program Files\7-Zip\7z.exe",
+        r"C:\Program Files (x86)\7-Zip\7z.exe",
+        "/usr/bin/7z",
+        "/usr/local/bin/7z",
+        "/usr/bin/7za",
+        "/opt/homebrew/bin/7z",
+    ]
+    for p in common_paths:
+        if os.path.exists(p):
+            return p
+
+    return None
+
+
+def find_unrar() -> str | None:
+    """Finds the unrar binary across environment variable, PATH, and common installation locations."""
+    unrar_env = os.getenv("UNRAR_PATH")
+    if unrar_env and os.path.exists(unrar_env):
+        return unrar_env
+
+    for candidate in ("unrar", "unrar.exe"):
+        found = shutil.which(candidate)
+        if found:
+            return found
+
+    common_paths = [
+        "/usr/bin/unrar",
+        "/usr/local/bin/unrar",
+        r"C:\Program Files\WinRAR\UnRAR.exe",
+        r"C:\Program Files\WinRAR\WinRAR.exe",
+    ]
+    for p in common_paths:
+        if os.path.exists(p):
+            return p
+
+    return None
+
 
 
 # ============================================================
@@ -133,14 +184,9 @@ def extract_archive(
     archive_type: str
 ) -> list[dict]:
     """
-    Extracts comic pages from an archive (CBR/CBZ) using 7-Zip.
+    Extracts comic pages from an archive (CBR/CBZ) using 7-Zip or fallback extractors.
     Generates dual assets: high-res original pages + low-res progressive thumbnails.
     """
-    if not os.path.exists(SEVEN_ZIP):
-        raise FileNotFoundError(
-            f"7-Zip executable not found at: {SEVEN_ZIP}"
-        )
-
     if not os.path.exists(archive_path):
         raise FileNotFoundError(
             f"Comic archive file not found: {archive_path}"
@@ -155,58 +201,84 @@ def extract_archive(
     start_time = time.perf_counter()
 
     try:
-        # Extract archive contents to temporary directory
-        # sp.run(
-        #     [
-        #         SEVEN_ZIP,
-        #         "x",
-        #         archive_path,
-        #         f"-o{temp_dir}",
-        #         "-y"
-        #     ],
-        #     check=True,
-        #     stdout=sp.PIPE,
-        #     stderr=sp.PIPE,
-        #     text=True
-        # )
-                # Extract archive contents to temporary directory
-        if archive_type.upper() == "CBR":
-            extractor = "/usr/bin/unrar"
+        archive_type_upper = archive_type.upper()
+        seven_zip = find_seven_zip()
+        extracted = False
 
-            if not os.path.exists(extractor):
-                raise FileNotFoundError(
-                    f"unrar executable not found at: {extractor}"
+        # Strategy 1: Use 7-Zip (supports CBZ/ZIP, CBR/RAR/RAR5, CB7/7Z, CBT/TAR)
+        if seven_zip:
+            try:
+                command = [
+                    seven_zip,
+                    "x",
+                    archive_path,
+                    f"-o{temp_dir}",
+                    "-y"
+                ]
+                sp.run(
+                    command,
+                    check=True,
+                    stdout=sp.PIPE,
+                    stderr=sp.PIPE,
+                    text=True
+                )
+                extracted = True
+                logger.info(
+                    "[EXTRACTOR] Successfully extracted %s archive using 7-Zip (%s)",
+                    archive_type_upper,
+                    seven_zip
+                )
+            except Exception as err:
+                logger.warning(
+                    "[EXTRACTOR] 7-Zip extraction failed for %s archive: %s. Attempting fallback.",
+                    archive_type_upper,
+                    err
                 )
 
-            command = [
-                extractor,
-                "x",
-                "-y",
-                archive_path,
-                str(temp_dir) + "/"
-            ]
-        else:
-            # CBZ uses 7-Zip
-            if not os.path.exists(SEVEN_ZIP):
-                raise FileNotFoundError(
-                    f"7-Zip executable not found at: {SEVEN_ZIP}"
+        # Strategy 2: Fallback for CBZ / ZIP using Python's built-in zipfile
+        if not extracted and archive_type_upper in ("CBZ", "ZIP"):
+            try:
+                with zipfile.ZipFile(archive_path, "r") as zf:
+                    zf.extractall(temp_dir)
+                extracted = True
+                logger.info("[EXTRACTOR] Extracted CBZ using built-in zipfile module.")
+            except Exception as err:
+                logger.error("[EXTRACTOR] Built-in zipfile extraction failed: %s", err)
+
+        # Strategy 3: Fallback for CBR / RAR using unrar binary if available
+        if not extracted and archive_type_upper in ("CBR", "RAR"):
+            unrar = find_unrar()
+            if unrar:
+                try:
+                    command = [
+                        unrar,
+                        "x",
+                        "-y",
+                        archive_path,
+                        str(temp_dir) + os.sep
+                    ]
+                    sp.run(
+                        command,
+                        check=True,
+                        stdout=sp.PIPE,
+                        stderr=sp.PIPE,
+                        text=True
+                    )
+                    extracted = True
+                    logger.info("[EXTRACTOR] Extracted CBR using unrar executable: %s", unrar)
+                except Exception as err:
+                    logger.error("[EXTRACTOR] unrar extraction failed: %s", err)
+
+        if not extracted:
+            if archive_type_upper in ("CBR", "RAR"):
+                raise RuntimeError(
+                    "Failed to extract CBR archive. 7-Zip or UnRAR was not found or could not extract the file. "
+                    "Please ensure 7-Zip is installed (e.g. C:\\Program Files\\7-Zip\\7z.exe) and configured in SEVEN_ZIP_PATH."
                 )
-
-            command = [
-                SEVEN_ZIP,
-                "x",
-                archive_path,
-                f"-o{temp_dir}",
-                "-y"
-            ]
-
-        result = sp.run(
-            command,
-            check=True,
-            stdout=sp.PIPE,
-            stderr=sp.PIPE,
-            text=True
-        )
+            else:
+                raise RuntimeError(
+                    f"Failed to extract {archive_type_upper} archive. No suitable extraction tool found."
+                )
 
         # Collect all valid image files
         image_files = []
