@@ -307,14 +307,20 @@ async def stream_in_conversation(
             db=db
         )
 
-        # 2. Conditional Query Reformulation (The Smart Step)
-        standalone_query = await reformulate_query_async(
-            query=request.question,
-            chat_history=history_str
-        )
+        # 2. Smart Fast-Path Query Reformulation
+        # Avoid blocking 10-15s call if there is no chat history or no ambiguous pronouns/follow-up indicators
+        standalone_query = request.question
+        if history_messages and any(re.search(rf"\b{re.escape(w)}\b", request.question, re.IGNORECASE) for w in FOLLOW_UP_INDICATORS):
+            standalone_query = await reformulate_query_async(
+                query=request.question,
+                chat_history=history_str
+            )
 
         normalized_standalone = normalize_query(standalone_query)
         retrieval_query = normalized_standalone
+
+        # ChromaDB top_k strictly limited to 3 chunks max to prevent context bloat and reasoning latency
+        CHROMA_TOP_K = 3
 
         is_page_scoped = is_page_scoped_query(standalone_query, request.current_page) or is_page_scoped_query(request.question, request.current_page)
         page_chunks = await asyncio.to_thread(get_chunks_by_page, comic_id, request.current_page) if request.current_page else []
@@ -338,61 +344,71 @@ async def stream_in_conversation(
         chunks = []
 
         if is_page_scoped:
-            for chunk in page_chunks:
+            for chunk in page_chunks[:CHROMA_TOP_K]:
                 cid = chunk.get("chunk_id")
                 if cid and cid not in seen_ids:
                     seen_ids.add(cid)
                     chunks.append(chunk)
             if not chunks:
-                # 3. Vector Search with the Standalone Query across all ingested pages
+                # 3. Vector Search with the Standalone Query across all ingested pages (strictly capped at 3)
                 semantic_chunks = await asyncio.to_thread(
                     retrieve_chunks,
                     query=retrieval_query,
                     comic_id=comic_id,
-                    top_k=DEFAULT_TOP_K
+                    top_k=CHROMA_TOP_K
                 )
                 for chunk in semantic_chunks:
                     cid = chunk.get("chunk_id")
                     if cid and cid not in seen_ids:
                         seen_ids.add(cid)
                         chunks.append(chunk)
+                    if len(chunks) >= CHROMA_TOP_K:
+                        break
         else:
             is_story_query = is_comic_wide_story_query(standalone_query) or is_comic_wide_story_query(request.question)
             if is_story_query:
                 overview_chunks = await asyncio.to_thread(get_comic_overview_chunks, comic_id)
-                for chunk in overview_chunks:
+                for chunk in overview_chunks[:CHROMA_TOP_K]:
                     cid = chunk.get("chunk_id")
                     if cid and cid not in seen_ids:
                         seen_ids.add(cid)
                         chunks.append(chunk)
 
-            # 3. Vector Search with the Standalone Query
-            semantic_chunks = await asyncio.to_thread(
-                retrieve_chunks,
-                query=retrieval_query,
-                comic_id=comic_id,
-                top_k=DEFAULT_TOP_K
-            )
-            for chunk in semantic_chunks:
-                cid = chunk.get("chunk_id")
-                if cid and cid not in seen_ids:
-                    seen_ids.add(cid)
-                    chunks.append(chunk)
+            # 3. Vector Search with the Standalone Query (strictly capped at 3)
+            if len(chunks) < CHROMA_TOP_K:
+                semantic_chunks = await asyncio.to_thread(
+                    retrieve_chunks,
+                    query=retrieval_query,
+                    comic_id=comic_id,
+                    top_k=CHROMA_TOP_K
+                )
+                for chunk in semantic_chunks:
+                    cid = chunk.get("chunk_id")
+                    if cid and cid not in seen_ids:
+                        seen_ids.add(cid)
+                        chunks.append(chunk)
+                    if len(chunks) >= CHROMA_TOP_K:
+                        break
 
             if not chunks:
                 overview_chunks = await asyncio.to_thread(get_comic_overview_chunks, comic_id)
-                for chunk in overview_chunks:
+                for chunk in overview_chunks[:CHROMA_TOP_K]:
                     cid = chunk.get("chunk_id")
                     if cid and cid not in seen_ids:
                         seen_ids.add(cid)
                         chunks.append(chunk)
 
-            if page_chunks and not is_story_query:
+            if page_chunks and not is_story_query and len(chunks) < CHROMA_TOP_K:
                 for chunk in page_chunks:
                     cid = chunk.get("chunk_id")
                     if cid and cid not in seen_ids:
                         seen_ids.add(cid)
                         chunks.append(chunk)
+                    if len(chunks) >= CHROMA_TOP_K:
+                        break
+
+        # Strictly enforce maximum 3 chunks to prevent prompt bloat and LLM reasoning delays
+        chunks = chunks[:CHROMA_TOP_K]
 
         if not chunks:
             is_processing = False

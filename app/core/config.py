@@ -61,7 +61,7 @@ COLLECTION_NAME = "comic_pages"
 VECTOR_STORE_BACKEND = os.getenv("VECTOR_STORE_BACKEND", "auto").lower()  # "auto", "supabase", "chroma"
 EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "1024"))
 DEFAULT_DISTANCE_THRESHOLD = float(os.getenv("DEFAULT_DISTANCE_THRESHOLD", "0.65"))
-DEFAULT_TOP_K = int(os.getenv("DEFAULT_TOP_K", "8"))
+DEFAULT_TOP_K = int(os.getenv("DEFAULT_TOP_K", "3"))
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
 

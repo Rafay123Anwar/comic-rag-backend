@@ -2402,6 +2402,7 @@ import time
 import requests
 import aiohttp
 import json
+import os
 
 from deep_translator import GoogleTranslator
 
@@ -2412,27 +2413,41 @@ from app.core.config import USE_LIBRARY_TRANSLATION
 # ==========================================
 # EDEN AI SETTINGS
 # ==========================================
-EDEN_API_KEY = "sk-eden-live-nlQJ9hMh0QdIsis1wCn2_hUzri4BFkWFnCw2U2RheNI1491a31a"  # YAHAN APNI EDEN AI KEY DAALAIN
-EDEN_URL = "https://api.edenai.run/v3/chat/completions"
-EDEN_MODEL = "google/gemma-4-31b-it"  
+EDEN_KEYS = [
+    os.getenv(f"EDEN_KEY_{i}") for i in range(1, 5)
+    if os.getenv(f"EDEN_KEY_{i}")
+]
+if not EDEN_KEYS:
+    fallback_k = os.getenv("EDEN_API_KEY", "sk-eden-live-nlQJ9hMh0QdIsis1wCn2_hUzri4BFkWFnCw2U2RheNI1491a31a")
+    EDEN_KEYS = [fallback_k]
+
+_eden_key_idx = 0
+
+def get_active_eden_key() -> str:
+    global _eden_key_idx
+    return EDEN_KEYS[_eden_key_idx % len(EDEN_KEYS)]
+
+def rotate_eden_key() -> str:
+    global _eden_key_idx
+    _eden_key_idx = (_eden_key_idx + 1) % len(EDEN_KEYS)
+    return get_active_eden_key()
+
+EDEN_URL = os.getenv("EDEN_API_URL", "https://api.edenai.run/v3/chat/completions")
+EDEN_MODEL = os.getenv("EDEN_MODEL", "google/gemma-4-26b-a4b-it")
 
 
 def _safe_chat_complete(
     messages: list[dict],
     model: str = EDEN_MODEL,
-    temperature: float = 0.3,
-    max_tokens: int = 5000,
-    max_retries: int = 5,
+    temperature: float = 0.2,
+    max_tokens: int = 1500,
+    max_retries: int = 4,
     **kwargs
 ) -> str:
     """
     Executes a standard POST request to Eden AI chat completions with retry logic.
     Returns the text response directly.
     """
-    headers = {
-        "Authorization": f"Bearer {EDEN_API_KEY}",
-        "Content-Type": "application/json"
-    }
     payload = {
         "model": model,
         "messages": messages,
@@ -2442,8 +2457,13 @@ def _safe_chat_complete(
     }
     
     for attempt in range(max_retries + 1):
+        key = get_active_eden_key()
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json"
+        }
         try:
-            resp = requests.post(EDEN_URL, headers=headers, json=payload, timeout=60)
+            resp = requests.post(EDEN_URL, headers=headers, json=payload, timeout=30)
             resp.raise_for_status()
             data = resp.json()
             choices = data.get("choices") if isinstance(data, dict) else None
@@ -2455,75 +2475,26 @@ def _safe_chat_complete(
             return ""
         except Exception as e:
             if attempt < max_retries:
-                wait_time = (2 ** attempt) * 2.5 + random.uniform(0.5, 1.5)
+                rotate_eden_key()
+                wait_time = (2 ** attempt) * 1.5 + random.uniform(0.3, 0.8)
                 time.sleep(wait_time)
             else:
                 print(f"Eden API Error (Sync): {e}")
                 return ""
 
 
-# def _safe_chat_stream(
-#     messages: list[dict],
-#     model: str = EDEN_MODEL,
-#     temperature: float = 0.3,
-#     max_tokens: int = 1800,
-#     max_retries: int = 5,
-#     **kwargs
-# ):
-#     """
-#     Executes a synchronous streaming request to Eden AI.
-#     Yields chunks of text.
-#     """
-#     headers = {
-#         "Authorization": f"Bearer {EDEN_API_KEY}",
-#         "Content-Type": "application/json"
-#     }
-#     payload = {
-#         "model": model,
-#         "messages": messages,
-#         "temperature": temperature,
-#         "max_tokens": max_tokens,
-#         "stream": True
-#     }
-    
-#     for attempt in range(max_retries + 1):
-#         try:
-#             with requests.post(EDEN_URL, headers=headers, json=payload, stream=True, timeout=60) as response:
-#                 response.raise_for_status()
-#                 for line in response.iter_lines():
-#                     if line:
-#                         line = line.decode('utf-8').strip()
-#                         if line.startswith("data: ") and line != "data: [DONE]":
-#                             try:
-#                                 data = json.loads(line[6:])
-#                                 delta = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
-#                                 if delta:
-#                                     yield delta
-#                             except json.JSONDecodeError:
-#                                 pass
-#             break
-#         except Exception as e:
-#             if attempt < max_retries:
-#                 wait_time = (2 ** attempt) * 2.5 + random.uniform(0.5, 1.5)
-#                 time.sleep(wait_time)
-#             else:
-#                 raise e
 def _safe_chat_stream(
     messages: list[dict],
     model: str = EDEN_MODEL,
-    temperature: float = 0.3,
-    max_tokens: int = 1800,
-    max_retries: int = 5,
+    temperature: float = 0.2,
+    max_tokens: int = 1500,
+    max_retries: int = 4,
     **kwargs
 ):
     """
     Executes a synchronous streaming request to Eden AI.
-    Yields chunks of text. Added rigorous debug prints.
+    Yields chunks of text in real time.
     """
-    headers = {
-        "Authorization": f"Bearer {EDEN_API_KEY}",
-        "Content-Type": "application/json"
-    }
     payload = {
         "model": model,
         "messages": messages,
@@ -2532,93 +2503,55 @@ def _safe_chat_stream(
         "stream": True
     }
     for attempt in range(max_retries + 1):
+        key = get_active_eden_key()
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json"
+        }
         try:
             with requests.post(EDEN_URL, headers=headers, json=payload, stream=True, timeout=60) as response:
                 response.raise_for_status()
                 for line in response.iter_lines():
                     if line:
-                        line = line.decode('utf-8').strip()
-                        if line.startswith("data: ") and line != "data: [DONE]":
-                            json_str = line[6:]
+                        line_str = line.decode('utf-8').strip()
+                        if line_str == "data: [DONE]":
+                            break
+                        if line_str.startswith("data: "):
+                            json_str = line_str[6:].strip()
                             try:
                                 data = json.loads(json_str)
-                                delta = data.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content")
-                                if content:
-                                    yield content
+                                choices = data.get("choices", [])
+                                if choices and len(choices) > 0:
+                                    delta = choices[0].get("delta", {})
+                                    content = delta.get("content")
+                                    if content:
+                                        yield content
                             except json.JSONDecodeError:
                                 pass
             break
         except Exception as e:
             if attempt < max_retries:
-                wait_time = (2 ** attempt) * 2.5 + random.uniform(0.5, 1.5)
+                rotate_eden_key()
+                wait_time = (2 ** attempt) * 1.5 + random.uniform(0.3, 0.8)
                 time.sleep(wait_time)
             else:
                 raise e
 
-# async def _safe_chat_stream_async(
-#     messages: list[dict],
-#     model: str = EDEN_MODEL,
-#     temperature: float = 0.3,
-#     max_tokens: int = 1800,
-#     max_retries: int = 5,
-#     **kwargs
-# ):
-#     """
-#     Executes an asynchronous streaming request to Eden AI.
-#     Yields chunks of text.
-#     """
-#     headers = {
-#         "Authorization": f"Bearer {EDEN_API_KEY}",
-#         "Content-Type": "application/json"
-#     }
-#     payload = {
-#         "model": model,
-#         "messages": messages,
-#         "temperature": temperature,
-#         "max_tokens": max_tokens,
-#         "stream": True
-#     }
-    
-#     for attempt in range(max_retries + 1):
-#         try:
-#             async with aiohttp.ClientSession() as session:
-#                 async with session.post(EDEN_URL, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as response:
-#                     response.raise_for_status()
-#                     async for line in response.content:
-#                         line = line.decode('utf-8').strip()
-#                         if line.startswith("data: ") and line != "data: [DONE]":
-#                             try:
-#                                 data = json.loads(line[6:])
-#                                 delta = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
-#                                 if delta:
-#                                     yield delta
-#                             except json.JSONDecodeError:
-#                                 pass
-#             break
-#         except Exception as e:
-#             if attempt < max_retries:
-#                 wait_time = (2 ** attempt) * 2.5 + random.uniform(0.5, 1.5)
-#                 await asyncio.sleep(wait_time)
-#             else:
-#                 raise e
 
 async def _safe_chat_stream_async(
     messages: list[dict],
     model: str = EDEN_MODEL,
-    temperature: float = 0.3,
-    max_tokens: int = 1800,
-    max_retries: int = 5,
+    temperature: float = 0.2,
+    max_tokens: int = 1500,
+    max_retries: int = 4,
     **kwargs
 ):
     """
-    Executes an asynchronous streaming request to Eden AI.
-    Yields text content chunks.
+    Executes an asynchronous streaming request to Eden AI using httpx.AsyncClient.
+    Yields text content tokens immediately in real time as they arrive.
     """
-    headers = {
-        "Authorization": f"Bearer {EDEN_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    import httpx
+
     payload = {
         "model": model,
         "messages": messages,
@@ -2628,32 +2561,42 @@ async def _safe_chat_stream_async(
     }
 
     for attempt in range(max_retries + 1):
+        key = get_active_eden_key()
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json"
+        }
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(EDEN_URL, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as response:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=90.0, write=10.0, pool=10.0)) as client:
+                async with client.stream("POST", EDEN_URL, headers=headers, json=payload) as response:
                     response.raise_for_status()
-                    async for line in response.content:
-                        line = line.decode('utf-8').strip()
+                    async for line in response.aiter_lines():
                         if not line:
                             continue
-                        if line.startswith("data: ") and line != "data: [DONE]":
-                            json_str = line[6:]
+                        line_str = line.strip()
+                        if line_str == "data: [DONE]":
+                            break
+                        if line_str.startswith("data: "):
+                            json_str = line_str[6:].strip()
                             try:
                                 data = json.loads(json_str)
-                                delta = data.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content")
-                                if content:
-                                    yield content
-                            except json.JSONDecodeError:
+                                choices = data.get("choices", [])
+                                if choices and len(choices) > 0:
+                                    delta = choices[0].get("delta", {})
+                                    content = delta.get("content")
+                                    if content:
+                                        yield content
+                            except (json.JSONDecodeError, KeyError):
                                 pass
-            break
+            return
         except Exception as e:
             if attempt < max_retries:
-                wait_time = (2 ** attempt) * 2.5 + random.uniform(0.5, 1.5)
-                print(f"[DEBUG - ASYNC STREAM] Retrying in {wait_time:.2f} seconds...")
+                rotate_eden_key()
+                wait_time = (2 ** attempt) * 1.5 + random.uniform(0.3, 0.8)
+                print(f"[EDEN STREAM ASYNC] Retrying ({attempt+1}/{max_retries}) with next key in {wait_time:.1f}s due to {e}")
                 await asyncio.sleep(wait_time)
             else:
-                print("[DEBUG - ASYNC STREAM] Max retries reached. Raising exception.")
+                print(f"[EDEN STREAM ASYNC] Error after retries: {e}")
                 raise e
 
 ENGLISH_FUNCTION_WORDS = {
