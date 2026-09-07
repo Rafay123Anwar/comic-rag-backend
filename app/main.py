@@ -137,6 +137,15 @@ async def lifespan(app: FastAPI):
     )
     recovery_thread.start()
 
+    # Clean up any leftover extracted folders or uploaded archives from completed comics to reclaim disk space
+    from app.services.storage import cleanup_orphaned_storage
+    cleanup_thread = threading.Thread(
+        target=cleanup_orphaned_storage,
+        daemon=True,
+        name="startup-storage-cleanup",
+    )
+    cleanup_thread.start()
+
     yield
 
 

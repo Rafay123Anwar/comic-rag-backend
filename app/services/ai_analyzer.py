@@ -3817,7 +3817,15 @@ def _encode_and_scale_image(
     max_dimension: int = 1600,
     quality: int = 85,
 ) -> str:
-    with Image.open(image_path) as img:
+    if str(image_path).startswith("http://") or str(image_path).startswith("https://"):
+        req = urllib.request.Request(str(image_path), headers={"User-Agent": "ComicRAG/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+        raw_img = Image.open(io.BytesIO(data))
+    else:
+        raw_img = Image.open(image_path)
+
+    with raw_img as img:
         if img.mode != "RGB":
             img = img.convert("RGB")
 
@@ -3857,6 +3865,7 @@ def analyze_page(image_path: str, draft_ocr: str = "") -> dict:
     EdenAI receives the exact universal comic-analysis prompt and
     performs OCR, panel detection, text extraction, and visual
     extraction in one request.
+    Supports either a local file path or a direct Cloudinary image URL.
     """
     image_b64 = _encode_and_scale_image(
         image_path,
@@ -3932,22 +3941,28 @@ def analyze_pages(
         attempts = 0
         retry_wait_total = 0.0
 
-        if not Path(image_path).exists():
-            duration = time.perf_counter() - page_start
-            return {
-                "page_number": page_number,
-                "filename": page.get("filename", Path(image_path).name),
-                "image_path": image_path,
-                "analysis": None,
-                "metadata": {"page_number": page_number},
-                "status": "error",
-                "error": f"Image file not found: {image_path}",
-                "perf": {
-                    "duration": duration,
-                    "attempts": 1,
-                    "retry_wait": 0.0,
-                },
-            }
+        # Determine target image: local file or Cloudinary CDN fallback if already uploaded and cleaned up
+        img_target = image_path
+        if not (img_target and (str(img_target).startswith("http://") or str(img_target).startswith("https://") or Path(img_target).exists())):
+            cdn_url = page.get("image_url")
+            if cdn_url and (str(cdn_url).startswith("http://") or str(cdn_url).startswith("https://")):
+                img_target = cdn_url
+            else:
+                duration = time.perf_counter() - page_start
+                return {
+                    "page_number": page_number,
+                    "filename": page.get("filename", Path(image_path).name if image_path else f"page_{page_number}.jpg"),
+                    "image_path": image_path,
+                    "analysis": None,
+                    "metadata": {"page_number": page_number},
+                    "status": "error",
+                    "error": f"Image file not found on disk or CDN: {image_path}",
+                    "perf": {
+                        "duration": duration,
+                        "attempts": 1,
+                        "retry_wait": 0.0,
+                    },
+                }
 
         last_error = None
 
@@ -3956,7 +3971,7 @@ def analyze_pages(
             retry_start = time.perf_counter()
 
             try:
-                result = analyze_page(image_path)
+                result = analyze_page(img_target)
                 result = _normalize_page_analysis(result)
 
                 duration = time.perf_counter() - page_start
@@ -3967,6 +3982,14 @@ def analyze_pages(
                 full_text = text_data.get("full_text", "")
                 if not isinstance(full_text, str):
                     full_text = str(full_text or "")
+
+                # Immediate File-by-File Cleanup: if local file still exists, delete it now that analysis succeeded
+                if image_path and Path(image_path).exists():
+                    try:
+                        os.remove(image_path)
+                        logger.info("[CLEANUP] Deleted analyzed local page image: %s", Path(image_path).name)
+                    except Exception as del_err:
+                        logger.debug("[CLEANUP] Could not remove analyzed image %s: %s", image_path, del_err)
 
                 return {
                     "page_number": page_number,

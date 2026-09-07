@@ -7,6 +7,7 @@ and local disk caching for high-performance reading and AI indexing.
 """
 import json
 import logging
+import os
 import shutil
 import threading
 from datetime import datetime, timezone
@@ -371,6 +372,12 @@ def upload_comic_assets_immediately(
                     overwrite=True
                 )
                 logger.info("[CLOUDINARY] Background upload completed for original file of comic %s", comic_id)
+                try:
+                    if original_file_path.exists():
+                        original_file_path.unlink(missing_ok=True)
+                        logger.info("[CLEANUP] Deleted original file after background upload: %s", original_file_path)
+                except Exception as orig_del_err:
+                    logger.warning("[CLEANUP] Failed to remove original archive file %s: %s", original_file_path, orig_del_err)
             except Exception as e:
                 logger.warning("[CLOUDINARY] Background archive upload error for comic %s: %s (non-fatal)", comic_id, str(e))
 
@@ -425,6 +432,14 @@ def upload_comic_assets_immediately(
                     )
                     img_url = res_img.get("secure_url")
                     img_pid = res_img.get("public_id")
+
+                    # Immediate File-by-File Cleanup: delete local page image the moment upload succeeds
+                    if img_url:
+                        try:
+                            os.remove(str(pfile))
+                            logger.info("[CLEANUP] Deleted local page image after Cloudinary upload: %s", pfile.name)
+                        except Exception as del_err:
+                            logger.warning("[CLEANUP] Failed to remove local page image %s: %s", pfile, del_err)
                 except Exception as e:
                     logger.warning("[CLOUDINARY] Failed to upload page %d image for %s: %s", pnum, comic_id, str(e))
 
@@ -439,6 +454,14 @@ def upload_comic_assets_immediately(
                     )
                     thumb_url = res_thumb.get("secure_url")
                     thumb_pid = res_thumb.get("public_id")
+
+                    # Immediate File-by-File Cleanup: delete local thumbnail the moment upload succeeds
+                    if thumb_url:
+                        try:
+                            os.remove(str(tfile))
+                            logger.info("[CLEANUP] Deleted local thumbnail after Cloudinary upload: %s", tfile.name)
+                        except Exception as del_err:
+                            logger.warning("[CLEANUP] Failed to remove local thumbnail %s: %s", tfile, del_err)
                 except Exception as e:
                     logger.warning("[CLOUDINARY] Failed to upload page %d thumb for %s: %s", pnum, comic_id, str(e))
 
@@ -808,3 +831,70 @@ def delete_comic_storage(comic_id: str, user_id: Optional[str] = None, db: Optio
         deleted_any = True
 
     return deleted_any
+
+
+def cleanup_orphaned_storage(db: Optional[Session] = None) -> dict:
+    """
+    Scans storage/comics and storage/uploads to free local disk space:
+    1. For completed/failed comics in PostgreSQL, wipes any remaining local folder in storage/comics/{comic_id}.
+    2. Deletes archive files in storage/uploads/ that are no longer actively being processed.
+    """
+    cleaned_dirs = 0
+    cleaned_files = 0
+    bytes_freed = 0
+
+    close_db = False
+    if db is None:
+        db = SessionLocal()
+        close_db = True
+
+    try:
+        all_processing_ids = set(
+            str(r[0]) for r in db.query(Comic.id).filter(Comic.status == "processing").all()
+        )
+
+        # 1. Clean any comic folder in storage/comics that is NOT currently processing
+        if COMICS_DIR.exists():
+            for cdir in COMICS_DIR.iterdir():
+                if cdir.is_dir() and (cdir.name not in all_processing_ids):
+                    try:
+                        for root, _, files in os.walk(cdir):
+                            for f in files:
+                                fp = os.path.join(root, f)
+                                try:
+                                    bytes_freed += os.path.getsize(fp)
+                                except OSError:
+                                    pass
+                        shutil.rmtree(cdir, ignore_errors=True)
+                        cleaned_dirs += 1
+                        logger.info("[CLEANUP] Cleaned inactive/completed comic storage directory: %s", cdir.name)
+                    except Exception as err:
+                        logger.warning("[CLEANUP] Failed removing comic folder %s: %s", cdir, err)
+
+        # 2. Clean uploads directory for files not currently processing
+        uploads_dir = Path(UPLOADS_DIR)
+        if uploads_dir.exists():
+            for ufile in uploads_dir.iterdir():
+                if ufile.is_file() and (ufile.stem not in all_processing_ids):
+                    try:
+                        bytes_freed += ufile.stat().st_size
+                        ufile.unlink(missing_ok=True)
+                        cleaned_files += 1
+                        logger.info("[CLEANUP] Cleaned uploaded archive file: %s", ufile.name)
+                    except Exception as uerr:
+                        logger.warning("[CLEANUP] Failed removing uploaded file %s: %s", ufile, uerr)
+
+    except Exception as e:
+        logger.warning("[CLEANUP] Error during orphaned storage cleanup: %s", e)
+    finally:
+        if close_db:
+            db.close()
+
+    mb_freed = bytes_freed / (1024 * 1024)
+    logger.info(
+        "[CLEANUP] Storage cleanup complete: %d dirs, %d files removed (%.2f MB freed)",
+        cleaned_dirs,
+        cleaned_files,
+        mb_freed
+    )
+    return {"cleaned_dirs": cleaned_dirs, "cleaned_files": cleaned_files, "mb_freed": mb_freed}

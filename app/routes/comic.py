@@ -14,7 +14,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from app.core.config import (
@@ -367,6 +367,25 @@ def run_background_comic_analysis(
     finally:
         with _active_comic_lock:
             _active_comic_processing.discard(comic_id)
+
+        # Complete Folder Cleanup: wipe extracted comic folder to free disk space immediately
+        try:
+            comic_storage_dir = Path(COMICS_DIR) / comic_id
+            if comic_storage_dir.exists():
+                shutil.rmtree(comic_storage_dir, ignore_errors=True)
+                logger.info("[CLEANUP] Completely wiped extracted comic folder: %s", comic_storage_dir)
+        except Exception as rmtree_err:
+            logger.warning("[CLEANUP] Failed wiping comic folder %s: %s", comic_id, rmtree_err)
+
+        # Remove the original archive file from storage/uploads/
+        if original_file_path:
+            try:
+                orig_p = Path(original_file_path)
+                if orig_p.exists() and orig_p.is_file():
+                    orig_p.unlink(missing_ok=True)
+                    logger.info("[CLEANUP] Removed original archive file from uploads: %s", orig_p)
+            except Exception as orig_err:
+                logger.warning("[CLEANUP] Failed removing original archive %s: %s", original_file_path, orig_err)
 
 
 def validate_comic_id(comic_id: str) -> str:
@@ -990,7 +1009,7 @@ async def get_comic_page_image(
 
     image_file_path = pages_dir / page_filename
 
-    # Fast path: Serve directly from local disk
+    # Fast path 1: Serve directly from local disk
     if image_file_path.exists() and image_file_path.is_file() and image_file_path.stat().st_size > 0:
         media_type, _ = mimetypes.guess_type(str(image_file_path))
         return FileResponse(
@@ -1001,6 +1020,10 @@ async def get_comic_page_image(
                 "Cache-Control": "public, max-age=86400, stale-while-revalidate=3600",
             }
         )
+
+    # Fast path 2: Direct redirect to Cloudinary CDN URL when local file is deleted by auto-cleanup
+    if db_page and db_page.image_url and str(db_page.image_url).startswith("http"):
+        return RedirectResponse(url=db_page.image_url, status_code=307)
 
     # Secondary check: Check alternative standard names on disk without guessing loop
     for alt_name in [f"page_{page_number:03d}.jpg", f"page_{page_number:03d}.png", f"page_{page_number:03d}.webp"]:
@@ -1095,7 +1118,11 @@ async def get_comic_page_thumbnail(
     finally:
         db.close()
 
-    # Fast path 2: Check if source page exists on local disk and generate thumbnail on-the-fly
+    # Fast path 2: Direct redirect to Cloudinary CDN URL when local thumbnail is deleted by auto-cleanup
+    if db_page and db_page.thumbnail_url and str(db_page.thumbnail_url).startswith("http"):
+        return RedirectResponse(url=db_page.thumbnail_url, status_code=307)
+
+    # Fast path 3: Check if source page exists on local disk and generate thumbnail on-the-fly
     pages_dir = (Path(COMICS_DIR) / valid_id / "pages").resolve()
     source_img_path = pages_dir / page_filename
 
