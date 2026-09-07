@@ -203,6 +203,33 @@ def run_background_comic_analysis(
                 except Exception as ing_err:
                     logger.warning("[PAGE PIPELINE] RAG INGESTION FAILED page=%d error=%s (non-fatal)", page_num, str(ing_err))
 
+        # Helper to provide EdenAI worker threads with real-time Cloudinary CDN URLs
+        def get_fresh_page_url(pnum: int) -> Optional[str]:
+            """
+            Thread-safe helper called immediately before/during page analysis to fetch the latest
+            Cloudinary CDN URL. First checks in-memory current_pages under state_lock, then queries
+            PostgreSQL ComicPage record directly.
+            """
+            with state_lock:
+                for p in current_pages:
+                    if int(p.get("page_number", 1)) == pnum:
+                        url = p.get("image_url")
+                        if url and (str(url).startswith("http://") or str(url).startswith("https://")):
+                            return str(url)
+
+            try:
+                with SessionLocal() as db_session:
+                    db_p = db_session.query(ComicPage).filter(
+                        ComicPage.comic_id == comic_id,
+                        ComicPage.page_number == pnum
+                    ).first()
+                    if db_p and db_p.image_url and (str(db_p.image_url).startswith("http://") or str(db_p.image_url).startswith("https://")):
+                        return str(db_p.image_url)
+            except Exception as db_err:
+                logger.debug("[BACKGROUND] get_fresh_page_url DB query error for page %d: %s", pnum, db_err)
+
+            return None
+
         # -------------------------------------------------------------
         # STEP 1 & 2: Concurrently execute Cloudinary Upload & EdenAI Analysis
         # -------------------------------------------------------------
@@ -227,7 +254,9 @@ def run_background_comic_analysis(
                     pages=pages_to_analyze,
                     max_workers=MAX_AI_WORKERS,
                     max_retries=MAX_AI_RETRIES,
-                    on_page_complete=handle_page_analyzed
+                    on_page_complete=handle_page_analyzed,
+                    comic_id=comic_id,
+                    get_page_url=get_fresh_page_url
                 )
 
             # Hook: When upload finishes, update current_pages with Cloudinary CDN URLs

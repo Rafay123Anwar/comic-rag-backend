@@ -3931,28 +3931,96 @@ def analyze_pages(
     max_workers: int = MAX_AI_WORKERS,
     max_retries: int = MAX_AI_RETRIES,
     on_page_complete: Optional[Callable[[dict, int, int], None]] = None,
+    comic_id: Optional[str] = None,
+    get_page_url: Optional[Callable[[int], Optional[str]]] = None,
 ) -> list:
     """Analyze comic pages in parallel using EdenAI only."""
 
     def process_page(page):
-        page_number = page["page_number"]
-        image_path = page["image_path"]
+        page_number = int(page["page_number"])
+        image_path = page.get("image_path")
         page_start = time.perf_counter()
         attempts = 0
         retry_wait_total = 0.0
 
-        # Determine target image: local file or Cloudinary CDN fallback if already uploaded and cleaned up
-        img_target = image_path
-        if not (img_target and (str(img_target).startswith("http://") or str(img_target).startswith("https://") or Path(img_target).exists())):
-            cdn_url = page.get("image_url")
-            if cdn_url and (str(cdn_url).startswith("http://") or str(cdn_url).startswith("https://")):
+        # Extract comic_id if not explicitly provided
+        cid = comic_id or page.get("comic_id")
+        if not cid and image_path:
+            try:
+                parts = Path(image_path).parts
+                if "comics" in parts:
+                    idx = parts.index("comics")
+                    if idx + 1 < len(parts):
+                        cid = parts[idx + 1]
+            except Exception:
+                pass
+
+        def _resolve_fresh_cdn_url() -> Optional[str]:
+            """
+            Immediately fetches the latest Cloudinary CDN URL for this page:
+            1. Calls get_page_url(page_number) callback (reads thread-safe current_pages under state_lock).
+            2. Queries PostgreSQL ComicPage record directly (fresh DB fetch).
+            3. Checks page dictionary image_url.
+            4. Deterministically constructs Cloudinary CDN URL from public_id convention.
+            """
+            # 1. Thread-safe callback from caller (comic.py)
+            if get_page_url:
+                try:
+                    cb_url = get_page_url(page_number)
+                    if cb_url and (str(cb_url).startswith("http://") or str(cb_url).startswith("https://")):
+                        return str(cb_url)
+                except Exception as cb_err:
+                    logger.debug("[AI ANALYZER] Callback error fetching page %d URL: %s", page_number, cb_err)
+
+            # 2. Fresh fetch from Database
+            if cid:
+                try:
+                    from app.core.database import SessionLocal
+                    from app.models.comic import ComicPage
+                    with SessionLocal() as db_session:
+                        db_p = db_session.query(ComicPage).filter(
+                            ComicPage.comic_id == str(cid),
+                            ComicPage.page_number == page_number
+                        ).first()
+                        if db_p and db_p.image_url and (str(db_p.image_url).startswith("http://") or str(db_p.image_url).startswith("https://")):
+                            return str(db_p.image_url)
+                except Exception as db_err:
+                    logger.debug("[AI ANALYZER] DB fetch error for page %d: %s", page_number, db_err)
+
+            # 3. Check page dict as fallback
+            stale_url = page.get("image_url")
+            if stale_url and (str(stale_url).startswith("http://") or str(stale_url).startswith("https://")):
+                return str(stale_url)
+
+            # 4. Deterministic Cloudinary CDN URL fallback
+            if cid:
+                try:
+                    cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME")
+                    if cloud_name:
+                        return f"https://res.cloudinary.com/{cloud_name}/image/upload/comics/{cid}/pages/page_{page_number:03d}.jpg"
+                except Exception:
+                    pass
+
+            return None
+
+        # Determine target image: local file or fresh Cloudinary CDN fallback
+        img_target = None
+        if image_path and Path(image_path).exists() and Path(image_path).is_file() and Path(image_path).stat().st_size > 0:
+            img_target = image_path
+        else:
+            # Local file missing on disk (Cloudinary worker uploaded and auto-cleaned it)
+            # Freshly resolve CDN URL from shared state or DB!
+            cdn_url = _resolve_fresh_cdn_url()
+            if cdn_url:
                 img_target = cdn_url
+                logger.info("[AI ANALYZER] Page %s local file not on disk. Using fresh CDN URL: %s", page_number, img_target)
             else:
                 duration = time.perf_counter() - page_start
                 return {
                     "page_number": page_number,
-                    "filename": page.get("filename", Path(image_path).name if image_path else f"page_{page_number}.jpg"),
+                    "filename": page.get("filename", Path(image_path).name if image_path else f"page_{page_number:03d}.jpg"),
                     "image_path": image_path,
+                    "image_url": None,
                     "analysis": None,
                     "metadata": {"page_number": page_number},
                     "status": "error",
@@ -3991,13 +4059,17 @@ def analyze_pages(
                     except Exception as del_err:
                         logger.debug("[CLEANUP] Could not remove analyzed image %s: %s", image_path, del_err)
 
+                # Use resolved CDN URL if img_target was a URL, otherwise retain any known image_url
+                resolved_img_url = img_target if str(img_target).startswith("http") else page.get("image_url")
+
                 return {
                     "page_number": page_number,
                     "filename": page.get(
                         "filename",
-                        Path(image_path).name,
+                        Path(image_path).name if image_path else f"page_{page_number:03d}.jpg",
                     ),
                     "image_path": image_path,
+                    "image_url": resolved_img_url,
                     "analysis": result,
                     "metadata": {
                         "page_number": page_number,
@@ -4013,6 +4085,13 @@ def analyze_pages(
 
             except Exception as exc:
                 last_error = exc
+
+                # If local file disappeared during attempt, immediately switch to fresh CDN URL for retry
+                if not (str(img_target).startswith("http://") or str(img_target).startswith("https://")):
+                    fresh_cdn = _resolve_fresh_cdn_url()
+                    if fresh_cdn:
+                        logger.info("[AI ANALYZER] Local image error for page %s; switching to CDN URL: %s", page_number, fresh_cdn)
+                        img_target = fresh_cdn
 
                 if attempt >= max_retries:
                     break
@@ -4042,9 +4121,10 @@ def analyze_pages(
             "page_number": page_number,
             "filename": page.get(
                 "filename",
-                Path(image_path).name,
+                Path(image_path).name if image_path else f"page_{page_number:03d}.jpg",
             ),
             "image_path": image_path,
+            "image_url": page.get("image_url"),
             "analysis": None,
             "metadata": {"page_number": page_number},
             "status": "error",

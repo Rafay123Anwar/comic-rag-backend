@@ -433,8 +433,22 @@ def upload_comic_assets_immediately(
                     img_url = res_img.get("secure_url")
                     img_pid = res_img.get("public_id")
 
-                    # Immediate File-by-File Cleanup: delete local page image the moment upload succeeds
+                    # Immediate File-by-File Cleanup: sync DB first then delete local page image
                     if img_url:
+                        try:
+                            with SessionLocal() as db_single:
+                                row = db_single.query(ComicPage).filter(
+                                    ComicPage.comic_id == comic_id,
+                                    ComicPage.page_number == pnum
+                                ).first()
+                                if row:
+                                    row.image_url = img_url
+                                    if img_pid:
+                                        row.image_storage_path = img_pid
+                                    db_single.commit()
+                        except Exception as sync_err:
+                            logger.debug("[CLOUDINARY] Immediate DB sync error for page %d: %s", pnum, sync_err)
+
                         try:
                             os.remove(str(pfile))
                             logger.info("[CLEANUP] Deleted local page image after Cloudinary upload: %s", pfile.name)
@@ -455,8 +469,22 @@ def upload_comic_assets_immediately(
                     thumb_url = res_thumb.get("secure_url")
                     thumb_pid = res_thumb.get("public_id")
 
-                    # Immediate File-by-File Cleanup: delete local thumbnail the moment upload succeeds
+                    # Immediate File-by-File Cleanup: sync DB first then delete local thumbnail
                     if thumb_url:
+                        try:
+                            with SessionLocal() as db_single:
+                                row = db_single.query(ComicPage).filter(
+                                    ComicPage.comic_id == comic_id,
+                                    ComicPage.page_number == pnum
+                                ).first()
+                                if row:
+                                    row.thumbnail_url = thumb_url
+                                    if thumb_pid:
+                                        row.thumbnail_storage_path = thumb_pid
+                                    db_single.commit()
+                        except Exception as sync_err:
+                            logger.debug("[CLOUDINARY] Immediate DB thumb sync error for page %d: %s", pnum, sync_err)
+
                         try:
                             os.remove(str(tfile))
                             logger.info("[CLEANUP] Deleted local thumbnail after Cloudinary upload: %s", tfile.name)
