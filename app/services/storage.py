@@ -225,6 +225,27 @@ def save_comic_to_db(
         img_url = page_dict.get("image_url")
         thumb_url = page_dict.get("thumbnail_url")
 
+        # Deterministic Cloudinary secure URL fallbacks
+        cld_img_url = (
+            f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{comic_id}/pages/page_{pnum:03d}.jpg"
+            if is_cloudinary_enabled() and CLOUDINARY_CLOUD_NAME else None
+        )
+        cld_thumb_url = (
+            f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{comic_id}/thumbnails/thumb_p{pnum:03d}.jpg"
+            if is_cloudinary_enabled() and CLOUDINARY_CLOUD_NAME else None
+        )
+
+        # Ensure database image_url / thumbnail_url NEVER stores relative API routes (/api/comics/...)
+        if img_url and str(img_url).startswith("/api/"):
+            img_url = cld_img_url
+        elif not img_url and cld_img_url:
+            img_url = cld_img_url
+
+        if thumb_url and str(thumb_url).startswith("/api/"):
+            thumb_url = cld_thumb_url
+        elif not thumb_url and cld_thumb_url:
+            thumb_url = cld_thumb_url
+
         if pnum in existing_pages:
             db_page = existing_pages[pnum]
             db_page.filename = fname
@@ -235,20 +256,24 @@ def save_comic_to_db(
                 db_page.image_storage_path = img_storage
             if thumb_storage:
                 db_page.thumbnail_storage_path = thumb_storage
-            if img_url:
+            if img_url and not str(img_url).startswith("/api/"):
                 db_page.image_url = img_url
-            if thumb_url:
+            elif cld_img_url and (not db_page.image_url or str(db_page.image_url).startswith("/api/")):
+                db_page.image_url = cld_img_url
+            if thumb_url and not str(thumb_url).startswith("/api/"):
                 db_page.thumbnail_url = thumb_url
+            elif cld_thumb_url and (not db_page.thumbnail_url or str(db_page.thumbnail_url).startswith("/api/")):
+                db_page.thumbnail_url = cld_thumb_url
         else:
             db_page = ComicPage(
                 comic_id=comic_id,
                 page_number=pnum,
                 filename=fname,
                 status=pstatus,
-                image_storage_path=img_storage,
-                thumbnail_storage_path=thumb_storage,
-                image_url=img_url,
-                thumbnail_url=thumb_url,
+                image_storage_path=img_storage or (f"comics/{comic_id}/pages/page_{pnum:03d}" if cld_img_url else None),
+                thumbnail_storage_path=thumb_storage or (f"comics/{comic_id}/thumbnails/thumb_p{pnum:03d}" if cld_thumb_url else None),
+                image_url=img_url if (img_url and not str(img_url).startswith("/api/")) else cld_img_url,
+                thumbnail_url=thumb_url if (thumb_url and not str(thumb_url).startswith("/api/")) else cld_thumb_url,
                 analysis_json=analysis_str
             )
             db.add(db_page)
@@ -397,7 +422,20 @@ def upload_comic_assets_immediately(
         fname = p_copy.get("filename", f"page_{pnum:03d}.jpg")
 
         local_pfile = Path(p_copy.get("image_path") or (pages_dir / fname))
+        if not (local_pfile and local_pfile.exists() and local_pfile.is_file()):
+            for ext in (".jpg", ".jpeg", ".png", ".webp"):
+                candidate = pages_dir / f"page_{pnum:03d}{ext}"
+                if candidate.exists() and candidate.is_file():
+                    local_pfile = candidate
+                    break
+
         local_tfile = Path(p_copy.get("thumbnail_path") or (thumb_dir / f"thumb_p{pnum:03d}.jpg"))
+        if not (local_tfile and local_tfile.exists() and local_tfile.is_file()):
+            for ext in (".jpg", ".jpeg", ".png", ".webp"):
+                candidate = thumb_dir / f"thumb_p{pnum:03d}{ext}"
+                if candidate.exists() and candidate.is_file():
+                    local_tfile = candidate
+                    break
 
         enriched_pages.append(p_copy)
 
@@ -415,6 +453,15 @@ def upload_comic_assets_immediately(
             pnum = item["page_number"]
             pfile = item["pfile"]
             tfile = item["tfile"]
+
+            cld_default_img = (
+                f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{comic_id}/pages/page_{pnum:03d}.jpg"
+                if CLOUDINARY_CLOUD_NAME else None
+            )
+            cld_default_thumb = (
+                f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{comic_id}/thumbnails/thumb_p{pnum:03d}.jpg"
+                if CLOUDINARY_CLOUD_NAME else None
+            )
 
             img_url = None
             thumb_url = None
@@ -457,6 +504,10 @@ def upload_comic_assets_immediately(
                 except Exception as e:
                     logger.warning("[CLOUDINARY] Failed to upload page %d image for %s: %s", pnum, comic_id, str(e))
 
+            if not img_url and cld_default_img:
+                img_url = cld_default_img
+                img_pid = img_pid or f"comics/{comic_id}/pages/page_{pnum:03d}"
+
             if tfile and tfile.exists() and tfile.is_file():
                 try:
                     res_thumb = cloudinary.uploader.upload(
@@ -493,6 +544,10 @@ def upload_comic_assets_immediately(
                 except Exception as e:
                     logger.warning("[CLOUDINARY] Failed to upload page %d thumb for %s: %s", pnum, comic_id, str(e))
 
+            if not thumb_url and cld_default_thumb:
+                thumb_url = cld_default_thumb
+                thumb_pid = thumb_pid or f"comics/{comic_id}/thumbnails/thumb_p{pnum:03d}"
+
             return pnum, img_url, thumb_url, img_pid, thumb_pid
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -504,12 +559,25 @@ def upload_comic_assets_immediately(
         for p in enriched_pages:
             pnum = int(p.get("page_number", 1))
             img_url, thumb_url, img_pid, thumb_pid = uploaded_updates.get(pnum, (None, None, None, None))
-            p["image_url"] = img_url or p.get("image_url") or f"/api/comics/{comic_id}/pages/{pnum}/image"
-            p["thumbnail_url"] = thumb_url or p.get("thumbnail_url") or f"/api/comics/{comic_id}/pages/{pnum}/thumbnail"
-            if img_pid:
-                p["image_storage_path"] = img_pid
-            if thumb_pid:
-                p["thumbnail_storage_path"] = thumb_pid
+            
+            cld_default_img = (
+                f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{comic_id}/pages/page_{pnum:03d}.jpg"
+                if is_cloudinary_enabled() and CLOUDINARY_CLOUD_NAME else None
+            )
+            cld_default_thumb = (
+                f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{comic_id}/thumbnails/thumb_p{pnum:03d}.jpg"
+                if is_cloudinary_enabled() and CLOUDINARY_CLOUD_NAME else None
+            )
+
+            existing_img = p.get("image_url") if (p.get("image_url") and not str(p.get("image_url")).startswith("/api/")) else None
+            existing_thumb = p.get("thumbnail_url") if (p.get("thumbnail_url") and not str(p.get("thumbnail_url")).startswith("/api/")) else None
+
+            p["image_url"] = img_url or existing_img or cld_default_img or f"/api/comics/{comic_id}/pages/{pnum}/image"
+            p["thumbnail_url"] = thumb_url or existing_thumb or cld_default_thumb or f"/api/comics/{comic_id}/pages/{pnum}/thumbnail"
+            if img_pid or cld_default_img:
+                p["image_storage_path"] = img_pid or f"comics/{comic_id}/pages/page_{pnum:03d}"
+            if thumb_pid or cld_default_thumb:
+                p["thumbnail_storage_path"] = thumb_pid or f"comics/{comic_id}/thumbnails/thumb_p{pnum:03d}"
     else:
         for p in enriched_pages:
             pnum = int(p.get("page_number", 1))
@@ -524,14 +592,38 @@ def upload_comic_assets_immediately(
         for db_p in db_pages:
             if db_p.page_number in page_dict_by_num:
                 enriched = page_dict_by_num[db_p.page_number]
+                pnum = db_p.page_number
+                cld_default_img = (
+                    f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{comic_id}/pages/page_{pnum:03d}.jpg"
+                    if is_cloudinary_enabled() and CLOUDINARY_CLOUD_NAME else None
+                )
+                cld_default_thumb = (
+                    f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{comic_id}/thumbnails/thumb_p{pnum:03d}.jpg"
+                    if is_cloudinary_enabled() and CLOUDINARY_CLOUD_NAME else None
+                )
+
                 if enriched.get("image_storage_path"):
                     db_p.image_storage_path = enriched["image_storage_path"]
+                elif cld_default_img:
+                    db_p.image_storage_path = f"comics/{comic_id}/pages/page_{pnum:03d}"
+
                 if enriched.get("thumbnail_storage_path"):
                     db_p.thumbnail_storage_path = enriched["thumbnail_storage_path"]
-                if enriched.get("image_url"):
-                    db_p.image_url = enriched["image_url"]
-                if enriched.get("thumbnail_url"):
-                    db_p.thumbnail_url = enriched["thumbnail_url"]
+                elif cld_default_thumb:
+                    db_p.thumbnail_storage_path = f"comics/{comic_id}/thumbnails/thumb_p{pnum:03d}"
+
+                # Ensure image_url is NEVER a relative API route in the database
+                target_img = enriched.get("image_url")
+                if target_img and not str(target_img).startswith("/api/"):
+                    db_p.image_url = target_img
+                elif cld_default_img:
+                    db_p.image_url = cld_default_img
+
+                target_thumb = enriched.get("thumbnail_url")
+                if target_thumb and not str(target_thumb).startswith("/api/"):
+                    db_p.thumbnail_url = target_thumb
+                elif cld_default_thumb:
+                    db_p.thumbnail_url = cld_default_thumb
         db.commit()
     except Exception as e:
         logger.warning("[CLOUDINARY] Failed to persist uploaded paths/URLs to DB for comic %s: %s", comic_id, str(e))

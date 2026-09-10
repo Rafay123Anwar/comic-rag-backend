@@ -4117,16 +4117,14 @@ def analyze_pages(
                 if not isinstance(full_text, str):
                     full_text = str(full_text or "")
 
-                # Immediate File-by-File Cleanup: if local file still exists, delete it now that analysis succeeded
-                if image_path and Path(image_path).exists():
-                    try:
-                        os.remove(image_path)
-                        logger.info("[CLEANUP] Deleted analyzed local page image: %s", Path(image_path).name)
-                    except Exception as del_err:
-                        logger.debug("[CLEANUP] Could not remove analyzed image %s: %s", image_path, del_err)
-
-                # Use resolved CDN URL if img_target was a URL, otherwise retain any known image_url
-                resolved_img_url = img_target if str(img_target).startswith("http") else page.get("image_url")
+                # Use resolved CDN URL if img_target was a URL, otherwise fetch fresh CDN URL or retain known valid image_url
+                resolved_img_url = None
+                if str(img_target).startswith("http"):
+                    resolved_img_url = img_target
+                elif page.get("image_url") and not str(page.get("image_url")).startswith("/api/"):
+                    resolved_img_url = page.get("image_url")
+                else:
+                    resolved_img_url = _resolve_fresh_cdn_url()
 
                 return {
                     "page_number": page_number,

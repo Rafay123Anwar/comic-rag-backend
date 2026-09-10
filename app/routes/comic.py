@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Callable, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse
@@ -19,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import (
     ALLOWED_EXTENSIONS,
+    CLOUDINARY_CLOUD_NAME,
     COMICS_DIR,
     MAX_AI_RETRIES,
     MAX_AI_WORKERS,
@@ -65,6 +67,7 @@ from app.services.storage import (
     get_comic_data,
     get_comic_json_data,
     get_comic_user_id,
+    is_cloudinary_enabled,
     list_all_comics,
     save_comic_json,
     sync_comic_assets_to_supabase,
@@ -616,13 +619,22 @@ async def upload_comic(
         img_storage = f"user/{current_user.id}/comics/{comic_id}/pages/{page_fn}"
         thumb_storage = f"user/{current_user.id}/comics/{comic_id}/thumbnails/thumb_p{page_num:03d}.jpg"
 
+        # Pre-map Cloudinary secure CDN URLs if Cloudinary is configured
+        cld_img = None
+        cld_thumb = None
+        if is_cloudinary_enabled() and CLOUDINARY_CLOUD_NAME:
+            cld_img = f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{comic_id}/pages/page_{page_num:03d}.jpg"
+            cld_thumb = f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{comic_id}/thumbnails/thumb_p{page_num:03d}.jpg"
+
         initial_pages.append({
             "page_number": page_num,
             "filename": page_fn,
             "image_path": page_img,
             "thumbnail_path": page_thumb,
-            "image_storage_path": img_storage,
-            "thumbnail_storage_path": thumb_storage,
+            "image_storage_path": (f"comics/{comic_id}/pages/page_{page_num:03d}" if cld_img else img_storage),
+            "thumbnail_storage_path": (f"comics/{comic_id}/thumbnails/thumb_p{page_num:03d}" if cld_thumb else thumb_storage),
+            "image_url": cld_img,
+            "thumbnail_url": cld_thumb,
             "analysis": {
                 "page_summary": "",
                 "panels_detected": 0,
@@ -1054,6 +1066,20 @@ async def get_comic_page_image(
     if db_page and db_page.image_url and str(db_page.image_url).startswith("http"):
         return RedirectResponse(url=db_page.image_url, status_code=307)
 
+    # Fast path 2b: Fallback to Cloudinary CDN URL if configured (self-heal relative DB entry)
+    if is_cloudinary_enabled() and CLOUDINARY_CLOUD_NAME:
+        cld_url = f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{valid_id}/pages/page_{page_number:03d}.jpg"
+        if db_page and (not db_page.image_url or str(db_page.image_url).startswith("/api/")):
+            try:
+                with SessionLocal() as db_heal:
+                    row = db_heal.query(ComicPage).filter(ComicPage.comic_id == valid_id, ComicPage.page_number == page_number).first()
+                    if row:
+                        row.image_url = cld_url
+                        db_heal.commit()
+            except Exception:
+                pass
+        return RedirectResponse(url=cld_url, status_code=307)
+
     # Secondary check: Check alternative standard names on disk without guessing loop
     for alt_name in [f"page_{page_number:03d}.jpg", f"page_{page_number:03d}.png", f"page_{page_number:03d}.webp"]:
         alt_path = pages_dir / alt_name
@@ -1150,6 +1176,20 @@ async def get_comic_page_thumbnail(
     # Fast path 2: Direct redirect to Cloudinary CDN URL when local thumbnail is deleted by auto-cleanup
     if db_page and db_page.thumbnail_url and str(db_page.thumbnail_url).startswith("http"):
         return RedirectResponse(url=db_page.thumbnail_url, status_code=307)
+
+    # Fast path 2b: Fallback to Cloudinary CDN URL if configured (self-heal relative DB entry)
+    if is_cloudinary_enabled() and CLOUDINARY_CLOUD_NAME:
+        cld_thumb = f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{valid_id}/thumbnails/thumb_p{page_number:03d}.jpg"
+        if db_page and (not db_page.thumbnail_url or str(db_page.thumbnail_url).startswith("/api/")):
+            try:
+                with SessionLocal() as db_heal:
+                    row = db_heal.query(ComicPage).filter(ComicPage.comic_id == valid_id, ComicPage.page_number == page_number).first()
+                    if row:
+                        row.thumbnail_url = cld_thumb
+                        db_heal.commit()
+            except Exception:
+                pass
+        return RedirectResponse(url=cld_thumb, status_code=307)
 
     # Fast path 3: Check if source page exists on local disk and generate thumbnail on-the-fly
     pages_dir = (Path(COMICS_DIR) / valid_id / "pages").resolve()
