@@ -386,31 +386,36 @@ def upload_comic_assets_immediately(
     thumb_dir = comic_dir / "thumbnails"
 
     # 1. Asynchronously upload original archive file in background to Cloudinary
-    if is_cloudinary_enabled() and original_file_path and original_file_path.exists():
-        def _upload_archive_in_background():
-            try:
-                cloudinary.uploader.upload(
-                    str(original_file_path),
-                    folder=f"comics/{comic_id}/original",
-                    public_id=original_file_path.stem,
-                    resource_type="raw",
-                    overwrite=True
-                )
-                logger.info("[CLOUDINARY] Background upload completed for original file of comic %s", comic_id)
-                try:
-                    if original_file_path.exists():
-                        original_file_path.unlink(missing_ok=True)
-                        logger.info("[CLEANUP] Deleted original file after background upload: %s", original_file_path)
-                except Exception as orig_del_err:
-                    logger.warning("[CLEANUP] Failed to remove original archive file %s: %s", original_file_path, orig_del_err)
-            except Exception as e:
-                logger.warning("[CLOUDINARY] Background archive upload error for comic %s: %s (non-fatal)", comic_id, str(e))
+    # if is_cloudinary_enabled() and original_file_path and original_file_path.exists():
+    #     def _upload_archive_in_background():
+    #         try:
+    #             cloudinary.uploader.upload(
+    #                 str(original_file_path),
+    #                 folder=f"comics/{comic_id}/original",
+    #                 public_id=original_file_path.stem,
+    #                 resource_type="raw",
+    #                 overwrite=True
+    #             )
+    #             logger.info("[CLOUDINARY] Background upload completed for original file of comic %s", comic_id)
+    #             try:
+    #                 if original_file_path.exists():
+    #                     original_file_path.unlink(missing_ok=True)
+    #                     logger.info("[CLEANUP] Deleted original file after background upload: %s", original_file_path)
+    #             except Exception as orig_del_err:
+    #                 logger.warning("[CLEANUP] Failed to remove original archive file %s: %s", original_file_path, orig_del_err)
+    #         except Exception as e:
+    #             logger.warning("[CLOUDINARY] Background archive upload error for comic %s: %s (non-fatal)", comic_id, str(e))
 
-        threading.Thread(
-            target=_upload_archive_in_background,
-            daemon=True,
-            name=f"archive-upload-{comic_id[:8]}"
-        ).start()
+    #     threading.Thread(
+    #         target=_upload_archive_in_background,
+    #         daemon=True,
+    #         name=f"archive-upload-{comic_id[:8]}"
+    #     ).start()
+    if original_file_path and original_file_path.exists():
+        try:
+            original_file_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     # 2. Concurrently upload page images and thumbnails to Cloudinary
     page_tasks = []
