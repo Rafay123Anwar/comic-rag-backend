@@ -4,9 +4,12 @@ Comic Routes
 API endpoints for comic upload, metadata retrieval, and question-answering.
 """
 import asyncio
+import base64
 import concurrent.futures
 import json
 import mimetypes
+import os
+import re
 import shutil
 import threading
 import time
@@ -14,6 +17,7 @@ import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
+import requests
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse
 from sqlalchemy.orm import Session
@@ -26,6 +30,7 @@ from app.core.config import (
     MAX_AI_WORKERS,
     MAX_UPLOAD_SIZE_BYTES,
     MAX_UPLOAD_SIZE_MB,
+    TEMP_DIR,
     UPLOADS_DIR,
 )
 from app.core.database import SessionLocal, get_db
@@ -60,6 +65,11 @@ from app.services.extractor import (
     extract_image,
     extract_pdf,
 )
+from app.services.llm import (
+    EDEN_API_KEY as LLM_EDEN_API_KEY,
+    EDEN_URL as LLM_EDEN_URL,
+    EDEN_MODEL as LLM_EDEN_MODEL,
+)
 from app.services.rag_ingestion import (
     ingest_comic_to_rag,
     ingest_page_to_rag,
@@ -84,6 +94,11 @@ router = APIRouter()
 # Ensure uploads directory exists on startup
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR = UPLOADS_DIR
+
+# Reconcile Eden AI settings (supporting both EDEN_API_URL and EDEN_URL conventions)
+VERIFY_EDEN_API_KEY = os.getenv("EDEN_API_KEY", LLM_EDEN_API_KEY)
+VERIFY_EDEN_URL = os.getenv("EDEN_API_URL", os.getenv("EDEN_URL", LLM_EDEN_URL))
+VERIFY_EDEN_MODEL = os.getenv("EDEN_MODEL", LLM_EDEN_MODEL)
 
 _active_comic_processing: set[str] = set()
 _active_comic_lock = threading.Lock()
@@ -628,6 +643,108 @@ def _extract_comic_pages(file_path: str, comic_id: str, extension: str) -> list[
         raise ValueError(f"Unsupported comic format '{extension}'")
 
 
+def _verify_comic_page_sync(image_path: str, timeout: float = 15.0) -> tuple[bool, str]:
+    """
+    Synchronously verifies whether Page 1 is genuine comic/manga/panel artwork via Eden AI.
+    Runs inside asyncio.to_thread to keep the event loop non-blocking.
+    Returns: (is_comic: bool, justification: str)
+    Fails open (returns True, '') on network errors, timeouts, or malformed responses.
+    """
+    if not VERIFY_EDEN_API_KEY:
+        logger.warning("[VERIFY COMIC] Eden AI API key not configured. Failing open to allow upload.")
+        return True, ""
+
+    img_p = Path(image_path)
+    if not img_p.exists():
+        logger.warning("[VERIFY COMIC] Page 1 image not found at %s. Failing open.", image_path)
+        return True, ""
+
+    try:
+        with open(img_p, "rb") as f:
+            image_bytes = f.read()
+        base64_image = base64.b64encode(image_bytes).decode("utf-8")
+
+        ext = img_p.suffix.lower()
+        mime_map = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".webp": "image/webp",
+        }
+        mime_type = mime_map.get(ext, "image/jpeg")
+
+        system_prompt = (
+            "You are an expert comic book analyzer. Your ONLY job is to verify if the provided image is a comic book page, comic panel, or comic artwork.\n"
+            "If it is a comic, output YES.\n"
+            "If it is a regular photograph, a real person, a landscape, a document, or literally ANYTHING ELSE, output NO.\n\n"
+            "CRITICAL INSTRUCTIONS: DO NOT use any internal thinking, reasoning, or step-by-step analysis blocks. Output your final answer immediately.\n\n"
+            "Output Rules:\n"
+            "1. Your first line must be ONLY 'YES' or 'NO'.\n"
+            "2. Your second line must be a short 1 sentence justification."
+        )
+
+        headers = {
+            "Authorization": f"Bearer {VERIFY_EDEN_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "model": VERIFY_EDEN_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Is this a comic image? Verify and justify. Answer immediately without reasoning."},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime_type};base64,{base64_image}"},
+                        },
+                    ],
+                },
+            ],
+            "max_tokens": 1024,
+            "temperature": 0.1,
+        }
+
+        response = requests.post(VERIFY_EDEN_URL, headers=headers, json=payload, timeout=timeout)
+        response.raise_for_status()
+        result = response.json()
+
+        choices = result.get("choices") if isinstance(result, dict) else None
+        if not choices or not isinstance(choices, list) or len(choices) == 0:
+            logger.warning("[VERIFY COMIC] Eden AI returned no choices. Failing open.")
+            return True, ""
+
+        message = choices[0].get("message") if isinstance(choices[0], dict) else {}
+        content = message.get("content") if isinstance(message, dict) else None
+        if not content:
+            logger.warning("[VERIFY COMIC] Eden AI returned empty content. Failing open.")
+            return True, ""
+
+        ai_text = str(content).strip()
+        ai_text = re.sub(r"<think>.*?</think>", "", ai_text, flags=re.DOTALL).strip()
+        lines = [line.strip() for line in ai_text.splitlines() if line.strip()]
+        if not lines:
+            return True, ""
+
+        first_line = lines[0].upper()
+        justification = lines[1] if len(lines) > 1 else ""
+
+        if first_line.startswith("NO") or (re.search(r"\bNO\b", first_line) and not re.search(r"\bYES\b", first_line)):
+            if not justification:
+                after_no = re.sub(r"^NO[:\s\-\.]*", "", lines[0], flags=re.IGNORECASE).strip()
+                justification = after_no or "The uploaded file does not appear to be a comic book, manga, or comic panel artwork."
+            logger.info("[VERIFY COMIC] Upload rejected by AI: %s", justification)
+            return False, justification
+
+        return True, justification
+
+    except Exception as e:
+        logger.warning("[VERIFY COMIC] Eden AI check error (%s). Failing open.", e)
+        return True, ""
+
+
 # ============================================================
 # Upload Comic Endpoint
 # ============================================================
@@ -722,6 +839,41 @@ async def upload_comic(
             status_code=500,
             detail=f"Comic extraction failed: {str(e)}"
         )
+
+    # Phase C.5: Verify Page 1 via Eden AI before database persistence or background pipeline dispatch
+    if pages and pages[0].get("image_path"):
+        page1_path = pages[0]["image_path"]
+        logger.info("[VERIFY COMIC] Running comic verification on page 1 (%s) for comic_id=%s...", page1_path, comic_id)
+        is_comic, justification = await asyncio.to_thread(
+            _verify_comic_page_sync,
+            page1_path,
+            15.0
+        )
+
+        if not is_comic:
+            logger.warning(
+                "[VERIFY COMIC] Comic rejected for comic_id=%s file=%s: %s",
+                comic_id,
+                file.filename,
+                justification
+            )
+            # Clean up all disk assets created for this upload
+            if file_path.exists():
+                file_path.unlink(missing_ok=True)
+
+            comic_dir = Path(COMICS_DIR) / comic_id
+            if comic_dir.exists():
+                shutil.rmtree(comic_dir, ignore_errors=True)
+
+            temp_dir = Path(TEMP_DIR) / comic_id
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+            detail_msg = justification or "Uploaded file does not appear to be a comic book, manga, or comic panel artwork."
+            raise HTTPException(
+                status_code=400,
+                detail=f"Comic verification failed: {detail_msg}"
+            )
 
     # Phase D: Initial page placeholders with dual resolution paths
     comic_name = Path(file.filename).stem
