@@ -16,10 +16,14 @@ venv/
 env/
 ENV/
 
+
+scripts
 # Temporary extraction files & uploads
 storage/temp/
 storage/uploads/
-
+storage/comics/
+storage/conversation/
+storage
 # Vector database (local cache/index)
 storage/vector_db/
 
@@ -30,3 +34,4 @@ storage/vector_db/
 Thumbs.db
 *.tmp
 *.tmp.json
+
