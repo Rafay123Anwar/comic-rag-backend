@@ -815,6 +815,10 @@ def list_all_comics(user_id: Optional[str] = None, db: Optional[Session] = None)
             if cover_path:
                 cover_paths.append(cover_path)
 
+            cld_cover = None
+            if is_cloudinary_enabled() and CLOUDINARY_CLOUD_NAME:
+                cld_cover = f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{c.id}/thumbnails/thumb_p001.jpg"
+
             comic_items.append({
                 "comic_id": c.id,
                 "title": c.title,
@@ -826,7 +830,7 @@ def list_all_comics(user_id: Optional[str] = None, db: Optional[Session] = None)
                 "last_opened_at": None,
                 "user_id": c.user_id,
                 "cover_storage_path": cover_path,
-                "cover_thumbnail_url": None,
+                "cover_thumbnail_url": cld_cover,
             })
 
         # Batch signed URLs for covers if Supabase enabled
@@ -834,7 +838,7 @@ def list_all_comics(user_id: Optional[str] = None, db: Optional[Session] = None)
             signed_map = get_signed_storage_urls(cover_paths, expires_in=3600)
             for item in comic_items:
                 cpath = item.pop("cover_storage_path", None)
-                if cpath:
+                if cpath and not item.get("cover_thumbnail_url"):
                     item["cover_thumbnail_url"] = signed_map.get(cpath)
         else:
             for item in comic_items:
@@ -867,8 +871,15 @@ def list_all_comics(user_id: Optional[str] = None, db: Optional[Session] = None)
             if user_id is not None and owner_id != user_id:
                 continue
 
+            cid = comic_meta.get("id") or comic_dir.name
+            cld_cover = (
+                f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{cid}/thumbnails/thumb_p001.jpg"
+                if is_cloudinary_enabled() and CLOUDINARY_CLOUD_NAME
+                else None
+            )
+
             comics.append({
-                "comic_id": comic_meta.get("id") or comic_dir.name,
+                "comic_id": cid,
                 "title": comic_meta.get("name") or "Untitled Comic",
                 "total_pages": comic_meta.get("total_pages", len(data.get("pages", []))),
                 "status": comic_meta.get("status", "completed"),
@@ -876,7 +887,8 @@ def list_all_comics(user_id: Optional[str] = None, db: Optional[Session] = None)
                 "source_format": comic_meta.get("source_format", "cbr"),
                 "uploaded_at": uploaded_at_iso,
                 "last_opened_at": None,
-                "user_id": owner_id
+                "user_id": owner_id,
+                "cover_thumbnail_url": cld_cover,
             })
         except Exception:
             continue
