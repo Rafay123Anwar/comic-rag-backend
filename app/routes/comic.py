@@ -19,7 +19,7 @@ from typing import Callable, Optional
 
 import requests
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from sqlalchemy.orm import Session
 
 from app.core.config import (
@@ -1333,60 +1333,78 @@ async def get_comic_page_image(
 
     image_file_path = pages_dir / page_filename
 
-    # Fast path 1: Serve directly from local disk
-    if image_file_path.exists() and image_file_path.is_file() and image_file_path.stat().st_size > 0:
-        media_type, _ = mimetypes.guess_type(str(image_file_path))
-        return FileResponse(
-            str(image_file_path),
-            media_type=media_type or "image/jpeg",
-            filename=image_file_path.name,
-            headers={
-                "Cache-Control": "public, max-age=86400, stale-while-revalidate=3600",
-            }
-        )
+    # Pre-resolve fallback raw Cloudinary URL in case local file is missing or deleted during race condition
+    fallback_cld_url = None
+    if db_page and db_page.image_url and str(db_page.image_url).startswith("http"):
+        fallback_cld_url = str(db_page.image_url)
+    elif is_cloudinary_enabled() and CLOUDINARY_CLOUD_NAME:
+        fallback_cld_url = f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{valid_id}/pages/page_{page_number:03d}.jpg"
+
+    # Fast path 1: Serve directly from local disk with TOCTOU safety net (non-blocking I/O)
+    try:
+        if image_file_path.exists() and image_file_path.is_file() and image_file_path.stat().st_size > 0:
+            content = await asyncio.to_thread(image_file_path.read_bytes)
+            media_type, _ = mimetypes.guess_type(str(image_file_path))
+            return Response(
+                content=content,
+                media_type=media_type or "image/jpeg",
+                headers={
+                    "Content-Length": str(len(content)),
+                    "Cache-Control": "public, max-age=86400, stale-while-revalidate=3600",
+                    "Content-Disposition": f'inline; filename="{image_file_path.name}"',
+                }
+            )
+    except (FileNotFoundError, OSError):
+        if fallback_cld_url:
+            return RedirectResponse(url=fallback_cld_url, status_code=307)
 
     # Fast path 2: Direct redirect to Cloudinary CDN URL when local file is deleted by auto-cleanup
-    if db_page and db_page.image_url and str(db_page.image_url).startswith("http"):
-        return RedirectResponse(url=db_page.image_url, status_code=307)
-
-    # Fast path 2b: Fallback to Cloudinary CDN URL if configured (self-heal relative DB entry)
-    if is_cloudinary_enabled() and CLOUDINARY_CLOUD_NAME:
-        cld_url = f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{valid_id}/pages/page_{page_number:03d}.jpg"
+    if fallback_cld_url:
         if db_page and (not db_page.image_url or str(db_page.image_url).startswith("/api/")):
             try:
-                db_page.image_url = cld_url
+                db_page.image_url = fallback_cld_url
                 db.commit()
             except Exception:
                 db.rollback()
-        return RedirectResponse(url=cld_url, status_code=307)
+        return RedirectResponse(url=fallback_cld_url, status_code=307)
 
-    # Secondary check: Check alternative standard names on disk without guessing loop
+    # Secondary check: Check alternative standard names on disk with TOCTOU safety net
     for alt_name in [f"page_{page_number:03d}.jpg", f"page_{page_number:03d}.png", f"page_{page_number:03d}.webp"]:
         alt_path = pages_dir / alt_name
-        if alt_path.exists() and alt_path.is_file() and alt_path.stat().st_size > 0:
-            media_type, _ = mimetypes.guess_type(str(alt_path))
-            return FileResponse(
-                str(alt_path),
-                media_type=media_type or "image/jpeg",
-                filename=alt_path.name,
-                headers={
-                    "Cache-Control": "public, max-age=86400, stale-while-revalidate=3600",
-                }
-            )
+        try:
+            if alt_path.exists() and alt_path.is_file() and alt_path.stat().st_size > 0:
+                content = await asyncio.to_thread(alt_path.read_bytes)
+                media_type, _ = mimetypes.guess_type(str(alt_path))
+                return Response(
+                    content=content,
+                    media_type=media_type or "image/jpeg",
+                    headers={
+                        "Content-Length": str(len(content)),
+                        "Cache-Control": "public, max-age=86400, stale-while-revalidate=3600",
+                        "Content-Disposition": f'inline; filename="{alt_path.name}"',
+                    }
+                )
+        except (FileNotFoundError, OSError):
+            if fallback_cld_url:
+                return RedirectResponse(url=fallback_cld_url, status_code=307)
 
     # 2. If missing from local disk, download exact storage path from Supabase Storage (single direct call)
     if is_supabase_storage_enabled():
         storage_key = exact_storage_key or f"user/{owner_id}/comics/{valid_id}/pages/{page_filename}"
         downloaded_bytes = download_bytes_from_storage(storage_key)
         if downloaded_bytes:
-            image_file_path.write_bytes(downloaded_bytes)
+            try:
+                await asyncio.to_thread(image_file_path.write_bytes, downloaded_bytes)
+            except Exception:
+                pass
             media_type, _ = mimetypes.guess_type(str(image_file_path))
-            return FileResponse(
-                str(image_file_path),
+            return Response(
+                content=downloaded_bytes,
                 media_type=media_type or "image/jpeg",
-                filename=image_file_path.name,
                 headers={
+                    "Content-Length": str(len(downloaded_bytes)),
                     "Cache-Control": "public, max-age=86400, stale-while-revalidate=3600",
+                    "Content-Disposition": f'inline; filename="{image_file_path.name}"',
                 }
             )
 
@@ -1457,31 +1475,39 @@ async def get_comic_page_thumbnail(
     thumb_dir.mkdir(parents=True, exist_ok=True)
     thumb_file = thumb_dir / f"thumb_p{page_number:03d}.jpg"
 
-    # Fast path 1: Serve already-cached thumbnail directly (now properly authorized)
-    if thumb_file.exists() and thumb_file.stat().st_size > 0:
-        return FileResponse(
-            str(thumb_file),
-            media_type="image/jpeg",
-            filename=f"thumb_{page_number}.jpg",
-            headers={
-                "Cache-Control": "public, max-age=86400, stale-while-revalidate=3600",
-            }
-        )
+    # Pre-resolve fallback raw Cloudinary thumbnail URL in case local file is missing or deleted during race condition
+    fallback_cld_thumb = None
+    if db_page and db_page.thumbnail_url and str(db_page.thumbnail_url).startswith("http"):
+        fallback_cld_thumb = str(db_page.thumbnail_url)
+    elif is_cloudinary_enabled() and CLOUDINARY_CLOUD_NAME:
+        fallback_cld_thumb = f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{valid_id}/thumbnails/thumb_p{page_number:03d}.jpg"
+
+    # Fast path 1: Serve already-cached thumbnail directly with TOCTOU safety net (non-blocking I/O)
+    try:
+        if thumb_file.exists() and thumb_file.is_file() and thumb_file.stat().st_size > 0:
+            content = await asyncio.to_thread(thumb_file.read_bytes)
+            return Response(
+                content=content,
+                media_type="image/jpeg",
+                headers={
+                    "Content-Length": str(len(content)),
+                    "Cache-Control": "public, max-age=86400, stale-while-revalidate=3600",
+                    "Content-Disposition": f'inline; filename="thumb_{page_number}.jpg"',
+                }
+            )
+    except (FileNotFoundError, OSError):
+        if fallback_cld_thumb:
+            return RedirectResponse(url=fallback_cld_thumb, status_code=307)
 
     # Fast path 2: Direct redirect to Cloudinary CDN URL when local thumbnail is deleted by auto-cleanup
-    if db_page and db_page.thumbnail_url and str(db_page.thumbnail_url).startswith("http"):
-        return RedirectResponse(url=db_page.thumbnail_url, status_code=307)
-
-    # Fast path 2b: Fallback to Cloudinary CDN URL if configured (self-heal relative DB entry)
-    if is_cloudinary_enabled() and CLOUDINARY_CLOUD_NAME:
-        cld_thumb = f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{valid_id}/thumbnails/thumb_p{page_number:03d}.jpg"
+    if fallback_cld_thumb:
         if db_page and (not db_page.thumbnail_url or str(db_page.thumbnail_url).startswith("/api/")):
             try:
-                db_page.thumbnail_url = cld_thumb
+                db_page.thumbnail_url = fallback_cld_thumb
                 db.commit()
             except Exception:
                 db.rollback()
-        return RedirectResponse(url=cld_thumb, status_code=307)
+        return RedirectResponse(url=fallback_cld_thumb, status_code=307)
 
     # Fast path 3: Check if source page exists on local disk and generate thumbnail on-the-fly
     pages_dir = (Path(COMICS_DIR) / valid_id / "pages").resolve()
@@ -1494,30 +1520,40 @@ async def get_comic_page_thumbnail(
                 source_img_path = alt_p
                 break
 
-    if source_img_path.exists() and source_img_path.is_file() and source_img_path.stat().st_size > 0:
-        generated_thumb = ensure_page_thumbnail(valid_id, page_number, source_img_path)
-        if generated_thumb and generated_thumb.exists() and generated_thumb.stat().st_size > 0:
-            return FileResponse(
-                str(generated_thumb),
-                media_type="image/jpeg",
-                filename=f"thumb_{page_number}.jpg",
-                headers={
-                    "Cache-Control": "public, max-age=86400, stale-while-revalidate=3600",
-                }
-            )
+    try:
+        if source_img_path.exists() and source_img_path.is_file() and source_img_path.stat().st_size > 0:
+            generated_thumb = await asyncio.to_thread(ensure_page_thumbnail, valid_id, page_number, source_img_path)
+            if generated_thumb and generated_thumb.exists() and generated_thumb.stat().st_size > 0:
+                content = await asyncio.to_thread(generated_thumb.read_bytes)
+                return Response(
+                    content=content,
+                    media_type="image/jpeg",
+                    headers={
+                        "Content-Length": str(len(content)),
+                        "Cache-Control": "public, max-age=86400, stale-while-revalidate=3600",
+                        "Content-Disposition": f'inline; filename="thumb_{page_number}.jpg"',
+                    }
+                )
+    except (FileNotFoundError, OSError):
+        if fallback_cld_thumb:
+            return RedirectResponse(url=fallback_cld_thumb, status_code=307)
 
     # Fast path 3: Supabase Storage single direct download for exact thumbnail path
     if is_supabase_storage_enabled():
         exact_thumb_key = exact_thumb_storage or f"user/{owner_id}/comics/{valid_id}/thumbnails/thumb_p{page_number:03d}.jpg"
         thumb_bytes = download_bytes_from_storage(exact_thumb_key)
         if thumb_bytes:
-            thumb_file.write_bytes(thumb_bytes)
-            return FileResponse(
-                str(thumb_file),
+            try:
+                await asyncio.to_thread(thumb_file.write_bytes, thumb_bytes)
+            except Exception:
+                pass
+            return Response(
+                content=thumb_bytes,
                 media_type="image/jpeg",
-                filename=f"thumb_{page_number}.jpg",
                 headers={
+                    "Content-Length": str(len(thumb_bytes)),
                     "Cache-Control": "public, max-age=86400, stale-while-revalidate=3600",
+                    "Content-Disposition": f'inline; filename="thumb_{page_number}.jpg"',
                 }
             )
 
