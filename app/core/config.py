@@ -81,7 +81,7 @@ ENABLE_HYBRID_OCR = os.getenv("ENABLE_HYBRID_OCR", "false").lower() in ("true", 
 # -----------------------------
 # Analysis & Extraction Config
 # -----------------------------
-MAX_AI_WORKERS = int(os.getenv("MAX_AI_WORKERS", "12"))
+MAX_AI_WORKERS = int(os.getenv("MAX_AI_WORKERS", "8"))
 print("MAX_AI_WORKERS", MAX_AI_WORKERS)
 MAX_AI_RETRIES = int(os.getenv("MAX_AI_RETRIES", "5"))
 SEVEN_ZIP_PATH = os.getenv(

@@ -2402,6 +2402,7 @@ import time
 import requests
 import aiohttp
 import json
+import logging
 
 from deep_translator import GoogleTranslator
 
@@ -2415,6 +2416,12 @@ from app.core.config import USE_LIBRARY_TRANSLATION
 EDEN_API_KEY = "sk-eden-live-nlQJ9hMh0QdIsis1wCn2_hUzri4BFkWFnCw2U2RheNI1491a31a"  # YAHAN APNI EDEN AI KEY DAALAIN
 EDEN_URL = "https://api.edenai.run/v3/chat/completions"
 EDEN_MODEL = "google/gemma-4-31b-it"  
+logger = logging.getLogger(__name__)
+
+
+class StreamInterruptedError(Exception):
+    """Raised when an LLM stream encounters an error after partial tokens were already yielded."""
+    pass
 
 
 def _safe_chat_complete(
@@ -2532,6 +2539,8 @@ def _safe_chat_stream(
         "stream": True
     }
     for attempt in range(max_retries + 1):
+        has_yielded = False
+        tokens_yielded_count = 0
         try:
             with requests.post(EDEN_URL, headers=headers, json=payload, stream=True, timeout=60) as response:
                 response.raise_for_status()
@@ -2542,14 +2551,25 @@ def _safe_chat_stream(
                             json_str = line[6:]
                             try:
                                 data = json.loads(json_str)
-                                delta = data.get("choices", [{}])[0].get("delta", {})
+                                choices = data.get("choices") or []
+                                if not choices:
+                                    continue
+                                delta = choices[0].get("delta", {}) if isinstance(choices[0], dict) else {}
                                 content = delta.get("content")
                                 if content:
+                                    has_yielded = True
+                                    tokens_yielded_count += 1
                                     yield content
                             except json.JSONDecodeError:
                                 pass
             break
         except Exception as e:
+            if has_yielded:
+                logger.warning(
+                    "[STREAM_ABORT_MIDWAY] Sync stream interrupted after %d chunks: %s. Aborting without restarting to prevent duplicate tokens.",
+                    tokens_yielded_count, e
+                )
+                raise StreamInterruptedError(f"Sync stream interrupted after {tokens_yielded_count} chunks: {e}") from e
             if attempt < max_retries:
                 wait_time = (2 ** attempt) * 2.5 + random.uniform(0.5, 1.5)
                 time.sleep(wait_time)
@@ -2628,6 +2648,8 @@ async def _safe_chat_stream_async(
     }
 
     for attempt in range(max_retries + 1):
+        has_yielded = False
+        tokens_yielded_count = 0
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(EDEN_URL, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as response:
@@ -2640,14 +2662,25 @@ async def _safe_chat_stream_async(
                             json_str = line[6:]
                             try:
                                 data = json.loads(json_str)
-                                delta = data.get("choices", [{}])[0].get("delta", {})
+                                choices = data.get("choices") or []
+                                if not choices:
+                                    continue
+                                delta = choices[0].get("delta", {}) if isinstance(choices[0], dict) else {}
                                 content = delta.get("content")
                                 if content:
+                                    has_yielded = True
+                                    tokens_yielded_count += 1
                                     yield content
                             except json.JSONDecodeError:
                                 pass
             break
         except Exception as e:
+            if has_yielded:
+                logger.warning(
+                    "[STREAM_ABORT_MIDWAY] Async stream interrupted after %d chunks: %s. Aborting without restarting to prevent duplicate tokens.",
+                    tokens_yielded_count, e
+                )
+                raise StreamInterruptedError(f"Async stream interrupted after {tokens_yielded_count} chunks: {e}") from e
             if attempt < max_retries:
                 wait_time = (2 ** attempt) * 2.5 + random.uniform(0.5, 1.5)
                 print(f"[DEBUG - ASYNC STREAM] Retrying in {wait_time:.2f} seconds...")
@@ -2833,6 +2866,10 @@ def clean_llm_response(text: str, question: str = "") -> str:
                 return match.group(0)
             return match.group(1)
         cleaned = re.sub(r"\*\*(.*?)\*\*", unbold_excess, cleaned)
+
+    # Deduplicate repeated opening sentence/clause if stream retry or model stutter duplicated it
+    cleaned = re.sub(r"^(.{15,250}?(?:[\.\!\?\n]+|\b))\s*\1\b", r"\1", cleaned, flags=re.DOTALL)
+
     return cleaned.strip()
 
 
@@ -3123,6 +3160,7 @@ async def stream_generate_answer_async(
     token_budget = get_dynamic_max_tokens(question, current_page)
 
     has_yielded = False
+    stream_resp = None
     try:
         stream_resp = _safe_chat_stream_async(
             model=EDEN_MODEL,
@@ -3139,11 +3177,16 @@ async def stream_generate_answer_async(
                 has_yielded = True
                 yield chunk
     except Exception as e:
+        if isinstance(e, StreamInterruptedError):
+            raise e
         print(f"Streaming Error (Async): {e}")
         # [NEW FIX] Fallback response if the LLM crashes mid-stream or token limit exceeds
         if not has_yielded:
             yield "Sorry, I couldn't generate an answer due to too much context. Try asking a more specific question."
         return
+    finally:
+        if stream_resp is not None:
+            await stream_resp.aclose()
         
     if not has_yielded:
         yield "Sorry, I encountered an issue while generating a response. Please try again."

@@ -3,7 +3,7 @@ Comic & ComicPage SQLAlchemy Models
 """
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -42,6 +42,9 @@ class Comic(Base):
 
 class ComicPage(Base):
     __tablename__ = "comic_pages"
+    __table_args__ = (
+        Index("idx_comic_page_lookup", "comic_id", "page_number", unique=True),
+    )
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
     comic_id = Column(String(36), ForeignKey("comics.id", ondelete="CASCADE"), nullable=False, index=True)

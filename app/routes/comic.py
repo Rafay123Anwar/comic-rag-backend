@@ -60,7 +60,11 @@ from app.services.extractor import (
     extract_image,
     extract_pdf,
 )
-from app.services.rag_ingestion import ingest_comic_to_rag, ingest_page_to_rag
+from app.services.rag_ingestion import (
+    ingest_comic_to_rag,
+    ingest_page_to_rag,
+    reconcile_comic_rag,
+)
 from app.services.rag_qa import answer_question
 from app.services.storage import (
     delete_comic_storage,
@@ -83,6 +87,8 @@ UPLOAD_DIR = UPLOADS_DIR
 
 _active_comic_processing: set[str] = set()
 _active_comic_lock = threading.Lock()
+COMIC_PIPELINE_SEMAPHORE = threading.Semaphore(2)  # Max 2 comics processing concurrently
+PIPELINE_ACQUIRE_TIMEOUT = 600  # 10 minutes timeout waiting for slot
 
 
 def run_background_comic_analysis(
@@ -109,10 +115,43 @@ def run_background_comic_analysis(
             return
         _active_comic_processing.add(comic_id)
 
-    t0 = time.perf_counter()
-    logger.info("[BACKGROUND] Starting concurrent comic pipeline for comic %s (%d pages)...", comic_id, len(pages))
+    logger.info(
+        "[BACKGROUND] Comic %s waiting for pipeline slot (max 2 concurrent, timeout=%ds)...",
+        comic_id,
+        PIPELINE_ACQUIRE_TIMEOUT
+    )
+    semaphore_acquired = COMIC_PIPELINE_SEMAPHORE.acquire(timeout=PIPELINE_ACQUIRE_TIMEOUT)
+    if not semaphore_acquired:
+        logger.error(
+            "[BACKGROUND] Concurrency timeout (%ds) waiting for pipeline slot for comic %s. Marking status='failed'.",
+            PIPELINE_ACQUIRE_TIMEOUT,
+            comic_id
+        )
+        try:
+            with SessionLocal() as db_timeout:
+                comic_row = db_timeout.query(Comic).filter(Comic.id == comic_id).first()
+                if comic_row:
+                    comic_row.status = "failed"
+                    db_timeout.commit()
+            save_comic_json(
+                comic_id=comic_id,
+                comic_name=comic_name,
+                source_format=source_format,
+                pages=initial_pages or pages,
+                status="failed",
+                total_pages=len(pages),
+                user_id=user_id
+            )
+        except Exception as timeout_err:
+            logger.error("[BACKGROUND] Error marking comic %s as failed after timeout: %s", comic_id, timeout_err)
+        finally:
+            with _active_comic_lock:
+                _active_comic_processing.discard(comic_id)
+        return
 
     try:
+        t0 = time.perf_counter()
+        logger.info("[BACKGROUND] Acquired pipeline slot. Starting concurrent comic pipeline for comic %s (%d pages)...", comic_id, len(pages))
         raw_pages = initial_pages or pages
         current_pages = [dict(p) for p in raw_pages]
         state_lock = threading.Lock()
@@ -323,15 +362,26 @@ def run_background_comic_analysis(
                 logger.warning("[BACKGROUND] Supabase upload future returned error for comic %s: %s (non-fatal)", comic_id, str(up_exc))
 
         # -------------------------------------------------------------
-        # STEP 3: Full Comic Chunking & ChromaDB / pgvector Ingestion
+        # STEP 3: Lightweight Dual-Store RAG Reconciliation
         # -------------------------------------------------------------
-        json_file_path = COMICS_DIR / comic_id / "comic.json"
-        if json_file_path.exists():
-            try:
-                logger.info("[BACKGROUND] Step 3: Chunking and ingesting full comic into ChromaDB for comic %s...", comic_id)
-                ingest_comic_to_rag(str(json_file_path))
-            except Exception as rag_err:
-                logger.warning("[BACKGROUND] Full comic RAG ingestion error for %s: %s (non-fatal)", comic_id, str(rag_err))
+        try:
+            logger.info("[BACKGROUND] Step 3: Reconciling dual-store RAG vector chunks for comic %s...", comic_id)
+            rec_result = reconcile_comic_rag(
+                comic_id=comic_id,
+                comic_name=comic_name,
+                source_format=source_format,
+                pages=current_pages
+            )
+            logger.info(
+                "[BACKGROUND] Step 3: RAG reconciliation complete for %s (Chroma: %d, Supabase: %d, healed: %d pages in %.2fs)",
+                comic_id,
+                rec_result.get("chroma_chunks", 0),
+                rec_result.get("supabase_chunks", 0),
+                rec_result.get("missing_pages_reconciled", 0),
+                rec_result.get("duration_seconds", 0.0)
+            )
+        except Exception as rag_err:
+            logger.warning("[BACKGROUND] RAG reconciliation error for %s: %s (non-fatal)", comic_id, str(rag_err))
 
         # -------------------------------------------------------------
         # STEP 4: Finally, update database status to 'completed'
@@ -385,6 +435,11 @@ def run_background_comic_analysis(
     except Exception as e:
         logger.exception("[COMIC PIPELINE] CRITICAL FATAL ERROR for comic %s: %s", comic_id, str(e))
         try:
+            with SessionLocal() as db_err:
+                comic_row = db_err.query(Comic).filter(Comic.id == comic_id).first()
+                if comic_row:
+                    comic_row.status = "failed"
+                    db_err.commit()
             save_comic_json(
                 comic_id=comic_id,
                 comic_name=comic_name,
@@ -397,6 +452,10 @@ def run_background_comic_analysis(
         except Exception:
             pass
     finally:
+        if semaphore_acquired:
+            COMIC_PIPELINE_SEMAPHORE.release()
+            logger.info("[BACKGROUND] Released pipeline slot for comic %s.", comic_id)
+
         with _active_comic_lock:
             _active_comic_processing.discard(comic_id)
 
@@ -512,6 +571,64 @@ def _handle_ask_question(question: str, comic_id: str, user_id: str | None = Non
 
 
 # ============================================================
+# Upload File Streaming & Extraction Helpers (Thread-safe)
+# ============================================================
+
+def _stream_save_upload_file(upload_file: UploadFile, destination: Path, max_size_bytes: int) -> int:
+    """
+    Streams upload_file.file in 64KB chunks directly to destination on disk.
+    Enforces maximum upload size without buffering the entire file into RAM.
+    Returns the total bytes written.
+    """
+    CHUNK_SIZE = 64 * 1024  # 64 KB
+    total_size = 0
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(destination, "wb") as buffer:
+            while True:
+                chunk = upload_file.file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > max_size_bytes:
+                    break
+                buffer.write(chunk)
+    except Exception as e:
+        if destination.exists():
+            destination.unlink(missing_ok=True)
+        raise e
+
+    if total_size > max_size_bytes:
+        if destination.exists():
+            destination.unlink(missing_ok=True)
+        raise ValueError("FILE_TOO_LARGE")
+
+    if total_size == 0:
+        if destination.exists():
+            destination.unlink(missing_ok=True)
+        raise ValueError("FILE_EMPTY")
+
+    return total_size
+
+
+def _extract_comic_pages(file_path: str, comic_id: str, extension: str) -> list[dict]:
+    """
+    Synchronous extraction helper to be run inside a worker thread via asyncio.to_thread.
+    Extracts high-res pages and generates thumbnails according to file extension.
+    """
+    if extension == ".cbr":
+        return extract_cbr(file_path, comic_id)
+    elif extension == ".cbz":
+        return extract_cbz(file_path, comic_id)
+    elif extension == ".pdf":
+        return extract_pdf(file_path, comic_id)
+    elif extension in ALLOWED_EXTENSIONS:
+        return extract_image(file_path, comic_id)
+    else:
+        raise ValueError(f"Unsupported comic format '{extension}'")
+
+
+# ============================================================
 # Upload Comic Endpoint
 # ============================================================
 
@@ -546,54 +663,52 @@ async def upload_comic(
             )
         )
 
-    # Phase A: Reading uploaded file bytes
-    contents = await file.read()
-
-    if len(contents) == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file is empty"
-        )
-
-    if len(contents) > MAX_UPLOAD_SIZE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File size ({len(contents) / (1024 * 1024):.1f} MB) exceeds the maximum allowed limit of {MAX_UPLOAD_SIZE_MB} MB. Please upload a smaller file."
-        )
-
     comic_id = str(uuid.uuid4())
     file_path = UPLOADS_DIR / f"{comic_id}{extension}"
 
-    # Phase B: Writing uploaded file to disk
+    # Phase A & B: Stream uploaded file to disk in 64KB chunks on a worker thread
     try:
-        with open(file_path, "wb") as buffer:
-            buffer.write(contents)
-    except Exception:
+        await asyncio.to_thread(
+            _stream_save_upload_file,
+            file,
+            file_path,
+            MAX_UPLOAD_SIZE_BYTES
+        )
+    except ValueError as ve:
+        err_type = str(ve)
+        if err_type == "FILE_EMPTY":
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded file is empty"
+            )
+        elif err_type == "FILE_TOO_LARGE":
+            raise HTTPException(
+                status_code=413,
+                detail=f"File size exceeds the maximum allowed limit of {MAX_UPLOAD_SIZE_MB} MB. Please upload a smaller file."
+            )
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error("[UPLOAD] Failed to save uploaded file for comic_id=%s: %s", comic_id, e, exc_info=True)
         raise HTTPException(
             status_code=500,
             detail="Failed to save uploaded file."
         )
 
-    # Phase C: Page extraction (fast, ~0.5 - 2s) with dual-resolution thumbnail creation
+    # Phase C: Page extraction with dual-resolution thumbnail creation offloaded to worker thread
     try:
-        if extension == ".cbr":
-            print("cbr Extracted")
-            pages = extract_cbr(str(file_path), comic_id)
-        elif extension == ".cbz":
-            print("cbz Extracted")
-            pages = extract_cbz(str(file_path), comic_id)
-        elif extension == ".pdf":
-            print("pdf Extracted")
-            pages = extract_pdf(str(file_path), comic_id)
-        elif extension in ALLOWED_EXTENSIONS:
-            pages = extract_image(str(file_path), comic_id)
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Unsupported comic format"
-            )
+        pages = await asyncio.to_thread(
+            _extract_comic_pages,
+            str(file_path),
+            comic_id,
+            extension
+        )
     except HTTPException:
         raise
+    except ValueError as ve:
+        raise HTTPException(
+            status_code=400,
+            detail=str(ve)
+        )
     except Exception as e:
         logger.error(
             "[UPLOAD] Comic extraction failed for comic_id=%s file=%s (%s): %s",
@@ -1026,27 +1141,43 @@ async def get_comic_page_image(
         )
 
     valid_id = validate_comic_id(comic_id)
-    check_comic_access(valid_id, current_user.id, db=db)
-    owner_id = get_comic_user_id(valid_id, db=db) or current_user.id
+
+    # 1. Single JOIN query: fetch ComicPage and verify comic ownership in 1 round-trip
+    row = (
+        db.query(ComicPage, Comic.user_id)
+        .join(Comic, ComicPage.comic_id == Comic.id)
+        .filter(
+            ComicPage.comic_id == valid_id,
+            ComicPage.page_number == page_number,
+        )
+        .first()
+    )
+
+    if not row:
+        # Re-run check_comic_access to provide exact error code (404 Comic not found vs 404 Page not found)
+        check_comic_access(valid_id, current_user.id, db=db)
+        raise HTTPException(
+            status_code=404,
+            detail=f"Page {page_number} not found for comic {valid_id}"
+        )
+
+    db_page, comic_owner_id = row
+    if comic_owner_id is not None and comic_owner_id != current_user.id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Comic with id {valid_id} not found"
+        )
+    owner_id = comic_owner_id or current_user.id
 
     pages_dir = (Path(COMICS_DIR) / valid_id / "pages").resolve()
     pages_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Fetch exact ComicPage record from PostgreSQL
-    try:
-        db_page = (
-            db.query(ComicPage)
-            .filter(ComicPage.comic_id == valid_id, ComicPage.page_number == page_number)
-            .first()
-        )
-        exact_storage_key = (
-            db_page.image_storage_path
-            if db_page and db_page.image_storage_path
-            else None
-        )
-        page_filename = db_page.filename if db_page and db_page.filename else f"page_{page_number:03d}.jpg"
-    finally:
-        db.close()
+    exact_storage_key = (
+        db_page.image_storage_path
+        if db_page and db_page.image_storage_path
+        else None
+    )
+    page_filename = db_page.filename if db_page and db_page.filename else f"page_{page_number:03d}.jpg"
 
     image_file_path = pages_dir / page_filename
 
@@ -1071,13 +1202,10 @@ async def get_comic_page_image(
         cld_url = f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{valid_id}/pages/page_{page_number:03d}.jpg"
         if db_page and (not db_page.image_url or str(db_page.image_url).startswith("/api/")):
             try:
-                with SessionLocal() as db_heal:
-                    row = db_heal.query(ComicPage).filter(ComicPage.comic_id == valid_id, ComicPage.page_number == page_number).first()
-                    if row:
-                        row.image_url = cld_url
-                        db_heal.commit()
+                db_page.image_url = cld_url
+                db.commit()
             except Exception:
-                pass
+                db.rollback()
         return RedirectResponse(url=cld_url, status_code=307)
 
     # Secondary check: Check alternative standard names on disk without guessing loop
@@ -1138,13 +1266,47 @@ async def get_comic_page_thumbnail(
         )
 
     valid_id = validate_comic_id(comic_id)
+
+    # 1. Single JOIN query: fetch ComicPage and verify comic ownership in 1 round-trip
+    row = (
+        db.query(ComicPage, Comic.user_id)
+        .join(Comic, ComicPage.comic_id == Comic.id)
+        .filter(
+            ComicPage.comic_id == valid_id,
+            ComicPage.page_number == page_number,
+        )
+        .first()
+    )
+
+    if not row:
+        # Re-run check_comic_access to provide exact error code (404 Comic not found vs 404 Page not found)
+        check_comic_access(valid_id, current_user.id, db=db)
+        raise HTTPException(
+            status_code=404,
+            detail=f"Page {page_number} not found for comic {valid_id}"
+        )
+
+    db_page, comic_owner_id = row
+    if comic_owner_id is not None and comic_owner_id != current_user.id:
+        raise HTTPException(
+            status_code=404,    
+            detail=f"Comic with id {valid_id} not found"
+        )
+    owner_id = comic_owner_id or current_user.id
+
+    exact_thumb_storage = (
+        db_page.thumbnail_storage_path
+        if db_page and db_page.thumbnail_storage_path
+        else None
+    )
+    page_filename = db_page.filename if db_page and db_page.filename else f"page_{page_number:03d}.jpg"
+
     thumb_dir = (Path(COMICS_DIR) / valid_id / "thumbnails").resolve()
     thumb_dir.mkdir(parents=True, exist_ok=True)
     thumb_file = thumb_dir / f"thumb_p{page_number:03d}.jpg"
 
-    # Fast path 1: Serve already-cached thumbnail directly (< 1ms) without DB query
+    # Fast path 1: Serve already-cached thumbnail directly (now properly authorized)
     if thumb_file.exists() and thumb_file.stat().st_size > 0:
-        db.close()
         return FileResponse(
             str(thumb_file),
             media_type="image/jpeg",
@@ -1153,25 +1315,6 @@ async def get_comic_page_thumbnail(
                 "Cache-Control": "public, max-age=86400, stale-while-revalidate=3600",
             }
         )
-
-    try:
-        check_comic_access(valid_id, current_user.id, db=db)
-        owner_id = get_comic_user_id(valid_id, db=db) or current_user.id
-
-        # 1. Fetch exact ComicPage record
-        db_page = (
-            db.query(ComicPage)
-            .filter(ComicPage.comic_id == valid_id, ComicPage.page_number == page_number)
-            .first()
-        )
-        exact_thumb_storage = (
-            db_page.thumbnail_storage_path
-            if db_page and db_page.thumbnail_storage_path
-            else None
-        )
-        page_filename = db_page.filename if db_page and db_page.filename else f"page_{page_number:03d}.jpg"
-    finally:
-        db.close()
 
     # Fast path 2: Direct redirect to Cloudinary CDN URL when local thumbnail is deleted by auto-cleanup
     if db_page and db_page.thumbnail_url and str(db_page.thumbnail_url).startswith("http"):
@@ -1182,13 +1325,10 @@ async def get_comic_page_thumbnail(
         cld_thumb = f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/comics/{valid_id}/thumbnails/thumb_p{page_number:03d}.jpg"
         if db_page and (not db_page.thumbnail_url or str(db_page.thumbnail_url).startswith("/api/")):
             try:
-                with SessionLocal() as db_heal:
-                    row = db_heal.query(ComicPage).filter(ComicPage.comic_id == valid_id, ComicPage.page_number == page_number).first()
-                    if row:
-                        row.thumbnail_url = cld_thumb
-                        db_heal.commit()
+                db_page.thumbnail_url = cld_thumb
+                db.commit()
             except Exception:
-                pass
+                db.rollback()
         return RedirectResponse(url=cld_thumb, status_code=307)
 
     # Fast path 3: Check if source page exists on local disk and generate thumbnail on-the-fly

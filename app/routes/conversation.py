@@ -5,13 +5,14 @@ API endpoints for conversation lifecycle management and context-aware chat.
 """
 import asyncio
 import json
+import logging
 import re
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.config import DEFAULT_TOP_K, MAX_CONVERSATION_MESSAGES
-from app.core.database import get_db
+from app.core.database import SessionLocal, get_db
 from app.models.comic import Comic
 from app.models.user import User
 from app.routes.comic import check_comic_access, validate_comic_id
@@ -37,6 +38,7 @@ from app.services.llm import (
     clean_llm_response,
     reformulate_query,
     reformulate_query_async,
+    StreamInterruptedError,
     stream_generate_answer_async,
 )
 from app.services.query_normalizer import normalize_query
@@ -53,6 +55,7 @@ from app.services.retriever import retrieve_chunks
 from app.services.vector_store import get_chunks_by_page
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _get_validated_conversation(
@@ -271,19 +274,27 @@ async def ask_in_conversation(
 )
 async def stream_in_conversation(
     conversation_id: str,
-    request: ConversationQuestionRequest,
-    current_user: User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    request: Request,
+    body: ConversationQuestionRequest,
+    current_user: User = Depends(get_current_active_user)
 ):
     """
     Streams the assistant's answer token-by-token using Server-Sent Events (SSE).
     Attaches sources metadata and persists user & assistant messages upon completion.
     """
-    conversation = _get_validated_conversation(conversation_id, current_user.id, db=db)
-    comic_id = conversation.get("comic_id")
+    # 1. Quick initial lookups with short-lived session (immediately closed and returned to pool)
+    with SessionLocal() as db_session:
+        conversation = _get_validated_conversation(conversation_id, current_user.id, db=db_session)
+        comic_id = conversation.get("comic_id")
+        history_messages, history_str = get_sliding_window_history(
+            conversation_id=conversation["conversation_id"],
+            comic_id=comic_id,
+            limit=5,
+            db=db_session
+        )
 
     async def sse_event_generator():
-        if not request.question or not request.question.strip():
+        if not body.question or not body.question.strip():
             msg = "Please provide a valid question."
             yield f"event: token\ndata: {json.dumps({'token': msg})}\n\n"
             yield f"event: done\ndata: {json.dumps({'conversation_id': conversation_id, 'answer': msg, 'sources': []})}\n\n"
@@ -293,42 +304,34 @@ async def stream_in_conversation(
         # 0. Active Page Information (Non-blocking)
         # -----------------------------
         page_obj = None
-        if request.current_page is not None:
+        if body.current_page is not None:
             try:
-                _, page_obj = get_page_info(comic_id, request.current_page)
+                _, page_obj = get_page_info(comic_id, body.current_page)
             except Exception:
                 page_obj = None
 
-        # 1. Fetch Comic-Specific Sliding Window History (limit=5)
-        history_messages, history_str = get_sliding_window_history(
-            conversation_id=conversation["conversation_id"],
-            comic_id=comic_id,
-            limit=5,
-            db=db
-        )
-
         # 2. Conditional Query Reformulation (The Smart Step)
         standalone_query = await reformulate_query_async(
-            query=request.question,
+            query=body.question,
             chat_history=history_str
         )
 
         normalized_standalone = normalize_query(standalone_query)
         retrieval_query = normalized_standalone
 
-        is_page_scoped = is_page_scoped_query(standalone_query, request.current_page) or is_page_scoped_query(request.question, request.current_page)
-        page_chunks = await asyncio.to_thread(get_chunks_by_page, comic_id, request.current_page) if request.current_page else []
+        is_page_scoped = is_page_scoped_query(standalone_query, body.current_page) or is_page_scoped_query(body.question, body.current_page)
+        page_chunks = await asyncio.to_thread(get_chunks_by_page, comic_id, body.current_page) if body.current_page else []
 
         # Fallback to direct comic.json page content if ChromaDB has not finished embedding page chunks
-        if request.current_page and not page_chunks and page_obj and page_obj.get("status") == "success":
+        if body.current_page and not page_chunks and page_obj and page_obj.get("status") == "success":
             content = build_page_content(page_obj)
             if content.strip():
                 page_chunks = [{
-                    "chunk_id": f"{comic_id}_page_{request.current_page}_chunk_1",
+                    "chunk_id": f"{comic_id}_page_{body.current_page}_chunk_1",
                     "content": content,
                     "metadata": {
                         "comic_id": comic_id,
-                        "page_number": request.current_page,
+                        "page_number": body.current_page,
                         "chunk_index": 1
                     },
                     "distance": 0.0
@@ -357,7 +360,7 @@ async def stream_in_conversation(
                         seen_ids.add(cid)
                         chunks.append(chunk)
         else:
-            is_story_query = is_comic_wide_story_query(standalone_query) or is_comic_wide_story_query(request.question)
+            is_story_query = is_comic_wide_story_query(standalone_query) or is_comic_wide_story_query(body.question)
             if is_story_query:
                 overview_chunks = await asyncio.to_thread(get_comic_overview_chunks, comic_id)
                 for chunk in overview_chunks:
@@ -397,9 +400,10 @@ async def stream_in_conversation(
         if not chunks:
             is_processing = False
             try:
-                comic_rec = db.query(Comic).filter(Comic.id == comic_id).first()
-                if comic_rec and comic_rec.status == "processing":
-                    is_processing = True
+                with SessionLocal() as db_check:
+                    comic_rec = db_check.query(Comic).filter(Comic.id == comic_id).first()
+                    if comic_rec and comic_rec.status == "processing":
+                        is_processing = True
             except Exception:
                 pass
 
@@ -410,8 +414,9 @@ async def stream_in_conversation(
             )
             yield f"event: token\ndata: {json.dumps({'token': fallback})}\n\n"
             yield f"event: done\ndata: {json.dumps({'conversation_id': conversation_id, 'answer': fallback, 'sources': []})}\n\n"
-            append_message(conversation["conversation_id"], role="user", content=request.question, db=db)
-            append_message(conversation["conversation_id"], role="assistant", content=fallback, db=db)
+            with SessionLocal() as db_commit:
+                append_message(conversation["conversation_id"], role="user", content=body.question, db=db_commit)
+                append_message(conversation["conversation_id"], role="assistant", content=fallback, db=db_commit)
             return
 
         context_parts = []
@@ -435,25 +440,76 @@ async def stream_in_conversation(
         # Yield sources early so UI receives citation references
         yield f"event: sources\ndata: {json.dumps({'sources': sources})}\n\n"
 
+        # Pre-flight check: If client disconnected during retrieval, abort before calling LLM
+        if await request.is_disconnected():
+            logger.info(
+                "[STREAM] Client disconnected before LLM generation started for conversation %s, aborting",
+                conversation_id
+            )
+            return
+
         # 4. Final Generation: Pass retrieved documents and standalone_query to main LLM
         full_tokens = []
-        async for token in stream_generate_answer_async(
+        is_incomplete = False
+        incomplete_reason: str | None = None
+        token_count = 0
+
+        gen = stream_generate_answer_async(
             question=standalone_query,
             context=context,
             conversation_history=history_messages,
-            current_page=request.current_page
-        ):
-            full_tokens.append(token)
-            yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+            current_page=body.current_page
+        )
+        try:
+            async for token in gen:
+                token_count += 1
+                # Check disconnect on token 1 and every 3 tokens (~90ms at 30 tok/s) to minimize overhead
+                if (token_count == 1 or token_count % 3 == 0) and await request.is_disconnected():
+                    is_incomplete = True
+                    incomplete_reason = "client_disconnect"
+                    logger.info(
+                        "[STREAM] Client disconnected, aborting LLM stream after %d tokens for conversation %s",
+                        len(full_tokens), conversation_id
+                    )
+                    break
+
+                full_tokens.append(token)
+                yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+        except StreamInterruptedError as e:
+            is_incomplete = True
+            incomplete_reason = "provider_interruption"
+            logger.warning(
+                "[STREAM_ABORT_MIDWAY] Conversation %s question '%s' aborted mid-stream (provider error): %s",
+                conversation_id, body.question[:50], e
+            )
+        finally:
+            await gen.aclose()
 
         full_answer = "".join(full_tokens).strip()
         cleaned_answer = clean_llm_response(full_answer, question=standalone_query)
+        if is_incomplete:
+            cleaned_answer = f"{cleaned_answer} [incomplete response]".strip()
 
-        # Save new User/Assistant interaction to database
-        append_message(conversation["conversation_id"], role="user", content=request.question, db=db)
-        append_message(conversation["conversation_id"], role="assistant", content=cleaned_answer, sources=sources, db=db)
+        # Database persistence strategy:
+        # - If client disconnected before ANY tokens were generated (0 tokens): skip saving entirely.
+        # - If client disconnected after yielding partial tokens, or if provider failed mid-stream,
+        #   or on successful completion: save user question and assistant answer.
+        should_save = True
+        if incomplete_reason == "client_disconnect" and len(full_tokens) == 0:
+            should_save = False
+            logger.info(
+                "[STREAM] Skipping DB message save for conversation %s (client disconnected with 0 tokens)",
+                conversation_id
+            )
 
-        yield f"event: done\ndata: {json.dumps({'conversation_id': conversation_id, 'answer': cleaned_answer, 'sources': sources})}\n\n"
+        if should_save:
+            with SessionLocal() as db_commit:
+                append_message(conversation["conversation_id"], role="user", content=body.question, db=db_commit)
+                append_message(conversation["conversation_id"], role="assistant", content=cleaned_answer, sources=sources, db=db_commit)
+
+        # Only attempt to yield the 'done' event if the client connection is still open
+        if incomplete_reason != "client_disconnect":
+            yield f"event: done\ndata: {json.dumps({'conversation_id': conversation_id, 'answer': cleaned_answer, 'sources': sources, 'is_incomplete': is_incomplete, 'incomplete_reason': incomplete_reason})}\n\n"
 
     return StreamingResponse(
         sse_event_generator(),

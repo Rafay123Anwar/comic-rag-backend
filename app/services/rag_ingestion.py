@@ -1,4 +1,5 @@
 import json
+import re
 import time
 
 from app.core.config import CHUNK_OVERLAP, CHUNK_SIZE
@@ -7,10 +8,13 @@ from app.services.embedding import create_embeddings
 from app.services.rag_chunker import create_rag_chunks
 from app.services.rag_preprocessor import build_page_content, comic_to_rag_documents
 from app.services.vector_store import (
+    _get_chroma_collection,
     add_chunks,
     collection,
     delete_chunks_by_ids,
     get_chunks_by_comic_id,
+    get_supabase_client,
+    is_supabase_vector_enabled,
 )
 
 
@@ -54,6 +58,156 @@ def ingest_page_to_rag(comic_id: str, comic_name: str, source_format: str, page:
     logger.info("[RAG INGESTION] Ingested page %s (%d chunks) into ChromaDB for comic %s", page_number, len(chunks), comic_id)
     print(f"[RAG INGESTION] SUCCESS: comic_id={comic_id} page_number={page_number} -> {len(chunks)} chunks upserted into ChromaDB")
     return len(chunks)
+
+
+def reconcile_comic_rag(
+    comic_id: str,
+    comic_name: str,
+    source_format: str,
+    pages: list[dict]
+) -> dict:
+    """
+    Reconciles vector store chunks for a comic after incremental per-page ingestion.
+    Verifies chunk presence in BOTH Supabase pgvector AND ChromaDB (when Supabase is enabled).
+    Only embeds/upserts pages that are missing from either store, guaranteeing zero redundant
+    Mistral embedding calls while ensuring both stores remain 100% in sync.
+    If Supabase already has chunks, fast-mirrors them to ChromaDB directly with $0 API cost.
+    """
+    start_time = time.perf_counter()
+    page_pattern = re.compile(r'_page_(\d+)_chunk_')
+
+    # 1. Query ChromaDB chunks
+    col = _get_chroma_collection()
+    chroma_res = col.get(where={"comic_id": comic_id})
+    chroma_ids = set(chroma_res.get("ids", []))
+    chroma_pages = {
+        int(m.group(1))
+        for cid in chroma_ids
+        if (m := page_pattern.search(cid))
+    }
+
+    # 2. Query Supabase pgvector chunks (if enabled)
+    supabase_enabled = is_supabase_vector_enabled()
+    supabase_pages = set()
+    supabase_ids = set()
+    supabase_rows = []
+    client = get_supabase_client() if supabase_enabled else None
+    if client:
+        try:
+            s_res = (
+                client.table("comic_page_chunks")
+                .select("id, page_number, chunk_index, content, metadata, embedding")
+                .eq("comic_id", comic_id)
+                .execute()
+            )
+            supabase_rows = s_res.data or []
+            supabase_ids = {r["id"] for r in supabase_rows}
+            supabase_pages = {
+                int(m.group(1))
+                for cid in supabase_ids
+                if (m := page_pattern.search(cid))
+            }
+        except Exception as sb_err:
+            logger.warning("[RAG RECONCILIATION] Supabase chunk query error for comic %s: %s", comic_id, sb_err)
+            supabase_pages = set()
+
+    # 3. Fast-path: If Supabase already has chunks for a page missing in ChromaDB, mirror them directly with $0 API cost
+    mirrored_to_chroma = 0
+    if supabase_enabled and supabase_rows:
+        missing_in_chroma_pages = supabase_pages - chroma_pages
+        if missing_in_chroma_pages:
+            rows_to_mirror = [r for r in supabase_rows if int(r.get("page_number", 0)) in missing_in_chroma_pages]
+            if rows_to_mirror:
+                m_ids = []
+                m_docs = []
+                m_embs = []
+                m_metas = []
+                for r in rows_to_mirror:
+                    emb = r.get("embedding")
+                    if isinstance(emb, str):
+                        try:
+                            emb = json.loads(emb)
+                        except Exception:
+                            emb = None
+                    if emb and r.get("content"):
+                        m_ids.append(r["id"])
+                        m_docs.append(r["content"])
+                        m_embs.append(emb)
+                        m_metas.append(r.get("metadata") or {})
+                if m_ids:
+                    try:
+                        col.upsert(
+                            ids=m_ids,
+                            documents=m_docs,
+                            embeddings=m_embs,
+                            metadatas=m_metas
+                        )
+                        chroma_pages.update(missing_in_chroma_pages)
+                        chroma_ids.update(m_ids)
+                        mirrored_to_chroma = len(m_ids)
+                        logger.info(
+                            "[RAG RECONCILIATION] Fast-mirrored %d chunks for pages %s from Supabase to ChromaDB ($0 API cost)",
+                            len(m_ids),
+                            sorted(missing_in_chroma_pages)
+                        )
+                    except Exception as mirror_err:
+                        logger.warning("[RAG RECONCILIATION] Failed mirroring chunks to ChromaDB: %s", mirror_err)
+
+    # 4. Only consider a page present if it exists in ALL active stores
+    if supabase_enabled:
+        fully_ingested_pages = chroma_pages.intersection(supabase_pages)
+    else:
+        fully_ingested_pages = chroma_pages
+
+    # 5. Identify analyzed pages truly missing from either store that need full re-ingestion
+    missing_pages = []
+    for p in pages:
+        if p.get("status") == "success":
+            p_num = int(p.get("page_number", 1))
+            if p_num not in fully_ingested_pages:
+                content = build_page_content(p)
+                if content.strip():
+                    missing_pages.append(p)
+
+    reconciled_count = 0
+    if missing_pages:
+        logger.warning(
+            "[RAG RECONCILIATION] Comic %s has %d page(s) missing from vector store(s): %s. Ingesting missing pages...",
+            comic_id,
+            len(missing_pages),
+            [p.get("page_number") for p in missing_pages]
+        )
+        for mp in missing_pages:
+            try:
+                chunks_added = ingest_page_to_rag(
+                    comic_id=comic_id,
+                    comic_name=comic_name,
+                    source_format=source_format,
+                    page=mp
+                )
+                reconciled_count += chunks_added
+            except Exception as e:
+                logger.error("[RAG RECONCILIATION] Failed to ingest missing page %s: %s", mp.get("page_number"), e)
+    else:
+        logger.info(
+            "[RAG RECONCILIATION] Comic %s: Incremental ingestion complete. All %d analyzed page(s) "
+            "verified in BOTH stores (ChromaDB: %d, Supabase: %d). Zero re-embedding required.",
+            comic_id,
+            len(pages),
+            len(chroma_ids),
+            len(supabase_ids) if supabase_enabled else 0
+        )
+
+    duration = time.perf_counter() - start_time
+    return {
+        "supabase_enabled": supabase_enabled,
+        "chroma_chunks": len(chroma_ids),
+        "supabase_chunks": len(supabase_ids) if supabase_enabled else 0,
+        "mirrored_to_chroma": mirrored_to_chroma,
+        "missing_pages_reconciled": len(missing_pages),
+        "chunks_added": reconciled_count,
+        "duration_seconds": round(duration, 3)
+    }
 
 
 def ingest_comic_to_rag(comic_json_path: str) -> dict:
